@@ -7,6 +7,7 @@
 #include <string.h>
 #include <limits.h>
 #include "matryoshka.h"
+#include "matryoshka_internal.h"
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -393,6 +394,300 @@ static void test_bulk_load_single(void)
     PASS();
 }
 
+/* ── Eager deletion: heavy deletion ───────────────────────────── */
+
+static void test_delete_heavy(void)
+{
+    TEST(delete_heavy_900_of_1000);
+    matryoshka_tree_t *t = matryoshka_create();
+    for (int i = 0; i < 1000; i++)
+        ASSERT(matryoshka_insert(t, i), "insert failed");
+
+    /* Delete 900 keys (every key except multiples of 10). */
+    int deleted = 0;
+    for (int i = 0; i < 1000; i++) {
+        if (i % 10 != 0) {
+            ASSERT(matryoshka_delete(t, i), "delete failed");
+            deleted++;
+        }
+    }
+    ASSERT(matryoshka_size(t) == 100, "wrong size after heavy delete");
+
+    /* Verify remaining keys. */
+    for (int i = 0; i < 1000; i++) {
+        if (i % 10 == 0)
+            ASSERT(matryoshka_contains(t, i), "remaining key missing");
+        else
+            ASSERT(!matryoshka_contains(t, i), "deleted key found");
+    }
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+/* ── Eager deletion: delete all ──────────────────────────────── */
+
+static void test_delete_all(void)
+{
+    TEST(delete_all_500);
+    matryoshka_tree_t *t = matryoshka_create();
+    for (int i = 0; i < 500; i++)
+        matryoshka_insert(t, i * 2);
+
+    for (int i = 0; i < 500; i++)
+        ASSERT(matryoshka_delete(t, i * 2), "delete failed");
+
+    ASSERT(matryoshka_size(t) == 0, "size != 0 after deleting all");
+    ASSERT(!matryoshka_contains(t, 0), "phantom key in empty tree");
+    matryoshka_destroy(t);
+    PASS();
+}
+
+/* ── Eager deletion: cascading merges (bulk load then deplete) ── */
+
+static void test_delete_cascading(void)
+{
+    TEST(delete_cascading_merges);
+    int n = 5000;
+    int32_t *keys = malloc((size_t)n * sizeof(int32_t));
+    for (int i = 0; i < n; i++) keys[i] = i;
+
+    matryoshka_tree_t *t = matryoshka_bulk_load(keys, (size_t)n);
+
+    /* Delete from the middle outward to trigger cascading merges. */
+    for (int i = n / 2; i < n; i++)
+        ASSERT(matryoshka_delete(t, i), "delete right failed");
+    for (int i = n / 2 - 1; i >= 0; i--)
+        ASSERT(matryoshka_delete(t, i), "delete left failed");
+
+    ASSERT(matryoshka_size(t) == 0, "size != 0");
+    matryoshka_destroy(t);
+    free(keys);
+    PASS();
+}
+
+/* ── Eager deletion: interleaved insert/delete ───────────────── */
+
+static void test_delete_interleaved(void)
+{
+    TEST(delete_interleaved_insert_delete);
+    matryoshka_tree_t *t = matryoshka_create();
+
+    /* Insert 2000, delete 1500, insert 1000, verify. */
+    for (int i = 0; i < 2000; i++)
+        matryoshka_insert(t, i);
+    for (int i = 0; i < 1500; i++)
+        matryoshka_delete(t, i);
+
+    ASSERT(matryoshka_size(t) == 500, "wrong size after partial delete");
+
+    for (int i = 1500; i < 2000; i++)
+        ASSERT(matryoshka_contains(t, i), "remaining key missing");
+
+    /* Insert more keys. */
+    for (int i = 3000; i < 4000; i++)
+        matryoshka_insert(t, i);
+
+    ASSERT(matryoshka_size(t) == 1500, "wrong size after re-insert");
+
+    /* Verify via iteration. */
+    matryoshka_iter_t *it = matryoshka_iter_from(t, INT32_MIN);
+    int count = 0;
+    int32_t key, prev = INT32_MIN;
+    while (matryoshka_iter_next(it, &key)) {
+        if (count > 0)
+            ASSERT(key > prev, "keys not strictly increasing");
+        prev = key;
+        count++;
+    }
+    ASSERT(count == 1500, "iteration count wrong");
+    matryoshka_iter_destroy(it);
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+/* ── Hierarchy: create_with (default) ─────────────────────────── */
+
+static void test_create_with_default(void)
+{
+    TEST(create_with_default_hierarchy);
+    mt_hierarchy_t hier;
+    mt_hierarchy_init_default(&hier);
+    matryoshka_tree_t *t = matryoshka_create_with(&hier);
+    ASSERT(t != NULL, "create_with returned NULL");
+    for (int i = 0; i < 500; i++)
+        ASSERT(matryoshka_insert(t, i * 2), "insert failed");
+    ASSERT(matryoshka_size(t) == 500, "wrong size");
+    for (int i = 0; i < 500; i++)
+        ASSERT(matryoshka_contains(t, i * 2), "key not found");
+    matryoshka_destroy(t);
+    PASS();
+}
+
+/* ── Hierarchy: bulk_load_with (default) ──────────────────────── */
+
+static void test_bulk_load_with_default(void)
+{
+    TEST(bulk_load_with_default_hierarchy);
+    mt_hierarchy_t hier;
+    mt_hierarchy_init_default(&hier);
+    int n = 10000;
+    int32_t *keys = malloc((size_t)n * sizeof(int32_t));
+    for (int i = 0; i < n; i++) keys[i] = i;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, (size_t)n, &hier);
+    ASSERT(t != NULL, "bulk_load_with returned NULL");
+    ASSERT(matryoshka_size(t) == (size_t)n, "wrong size");
+    for (int i = 0; i < n; i += 97)
+        ASSERT(matryoshka_contains(t, i), "key not found");
+    matryoshka_destroy(t);
+    free(keys);
+    PASS();
+}
+
+/* ── Hierarchy: custom SIMD-only (single level) ──────────────── */
+
+static void test_custom_hierarchy_simd_only(void)
+{
+    TEST(custom_hierarchy_simd_only);
+    mt_level_t levels[1] = { { .depth = 2, .hw_size = 16 } };
+    mt_hierarchy_t hier;
+    mt_hierarchy_init_custom(&hier, levels, 1, MT_PAGE_SIZE);
+    ASSERT(hier.num_levels == 1, "wrong num_levels");
+    ASSERT(hier.leaf_cap > 0, "leaf_cap is 0");
+
+    matryoshka_tree_t *t = matryoshka_create_with(&hier);
+    ASSERT(t != NULL, "create_with returned NULL");
+    for (int i = 0; i < 400; i++)
+        ASSERT(matryoshka_insert(t, i * 3), "insert failed");
+    ASSERT(matryoshka_size(t) == 400, "wrong size");
+    for (int i = 0; i < 400; i++)
+        ASSERT(matryoshka_contains(t, i * 3), "key not found");
+    ASSERT(!matryoshka_contains(t, 1), "phantom key");
+    matryoshka_destroy(t);
+    PASS();
+}
+
+/* ── Hierarchy: 3-level (SIMD + CL + page) ───────────────────── */
+
+static void test_custom_hierarchy_3level(void)
+{
+    TEST(custom_hierarchy_3_levels);
+    mt_level_t levels[3] = {
+        { .depth = 2,  .hw_size = 16 },
+        { .depth = 4,  .hw_size = 64 },
+        { .depth = 3,  .hw_size = 4096 },
+    };
+    mt_hierarchy_t hier;
+    mt_hierarchy_init_custom(&hier, levels, 3, MT_PAGE_SIZE);
+    ASSERT(hier.num_levels == 3, "wrong num_levels");
+
+    int n = 5000;
+    int32_t *keys = malloc((size_t)n * sizeof(int32_t));
+    for (int i = 0; i < n; i++) keys[i] = i * 2;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, (size_t)n, &hier);
+    ASSERT(t != NULL, "bulk_load_with returned NULL");
+    ASSERT(matryoshka_size(t) == (size_t)n, "wrong size");
+    for (int i = 0; i < n; i++)
+        ASSERT(matryoshka_contains(t, i * 2), "key not found");
+    ASSERT(!matryoshka_contains(t, 1), "phantom key");
+
+    /* Predecessor search. */
+    int32_t result;
+    ASSERT(matryoshka_search(t, 101, &result) && result == 100,
+           "pred(101) != 100");
+
+    matryoshka_destroy(t);
+    free(keys);
+    PASS();
+}
+
+/* ── Variable-width rank ─────────────────────────────────────── */
+
+static void test_hierarchy_rank_width(void)
+{
+    TEST(hierarchy_rank_width);
+    mt_hierarchy_t h;
+
+    /* Default: int16_t rank. */
+    mt_hierarchy_init_default(&h);
+    ASSERT(h.rank_wide == false, "default should use int16_t rank");
+    ASSERT(h.tree_cap == 512, "default tree_cap != 512");
+    ASSERT(h.leaf_cap == 511, "default leaf_cap != 511");
+
+    /* Superpage: int32_t rank. */
+    mt_hierarchy_init_superpage(&h);
+    ASSERT(h.rank_wide == true, "superpage should use int32_t rank");
+    ASSERT(h.leaf_cap == (1 << 18) - 1, "superpage leaf_cap wrong");
+    ASSERT(h.tree_cap == (1 << 18), "superpage tree_cap wrong");
+
+    /* Custom small: int16_t rank. */
+    mt_level_t levels[2] = {
+        { .depth = 2, .hw_size = 16 },
+        { .depth = 4, .hw_size = 64 },
+    };
+    mt_hierarchy_init_custom(&h, levels, 2, MT_PAGE_SIZE);
+    ASSERT(h.rank_wide == false, "page-sized should use int16_t rank");
+    ASSERT(h.leaf_cap <= 32767, "page-sized leaf_cap exceeds int16_t range");
+
+    PASS();
+}
+
+/* ── Arena allocator ──────────────────────────────────────────── */
+
+static void test_arena_basic(void)
+{
+    TEST(arena_allocator_basic);
+    /* Create an allocator with 64 KiB arenas, 4 KiB pages. */
+    mt_allocator_t *alloc = mt_allocator_create(65536, 4096);
+    ASSERT(alloc != NULL, "allocator create failed");
+
+    /* Allocate 16 pages (fills one arena). */
+    void *pages[16];
+    for (int i = 0; i < 16; i++) {
+        pages[i] = mt_allocator_alloc(alloc);
+        ASSERT(pages[i] != NULL, "alloc returned NULL");
+    }
+
+    /* All pages should be distinct. */
+    for (int i = 0; i < 16; i++)
+        for (int j = i + 1; j < 16; j++)
+            ASSERT(pages[i] != pages[j], "duplicate page pointers");
+
+    /* Free some and reallocate. */
+    mt_allocator_free(alloc, pages[5]);
+    mt_allocator_free(alloc, pages[10]);
+    void *p1 = mt_allocator_alloc(alloc);
+    void *p2 = mt_allocator_alloc(alloc);
+    ASSERT(p1 != NULL && p2 != NULL, "realloc after free failed");
+
+    /* Allocate more — should trigger a second arena. */
+    void *extra = mt_allocator_alloc(alloc);
+    ASSERT(extra != NULL, "alloc from second arena failed");
+
+    mt_allocator_destroy(alloc);
+    PASS();
+}
+
+static void test_arena_co_location(void)
+{
+    TEST(arena_co_location);
+    /* Allocations from the same arena should be within arena_size of each other. */
+    size_t arena_size = 65536;
+    mt_allocator_t *alloc = mt_allocator_create(arena_size, 4096);
+    void *p1 = mt_allocator_alloc(alloc);
+    void *p2 = mt_allocator_alloc(alloc);
+    ASSERT(p1 != NULL && p2 != NULL, "alloc failed");
+
+    size_t diff = ((char *)p2 > (char *)p1)
+                  ? (size_t)((char *)p2 - (char *)p1)
+                  : (size_t)((char *)p1 - (char *)p2);
+    ASSERT(diff < arena_size, "co-located pages not in same arena");
+
+    mt_allocator_destroy(alloc);
+    PASS();
+}
+
 /* ── Main ─────────────────────────────────────────────────────── */
 
 int main(void)
@@ -418,6 +713,17 @@ int main(void)
     test_iterator_full();
     test_iterator_from_midpoint();
     test_iterator_across_leaves();
+    test_delete_heavy();
+    test_delete_all();
+    test_delete_cascading();
+    test_delete_interleaved();
+    test_create_with_default();
+    test_bulk_load_with_default();
+    test_custom_hierarchy_simd_only();
+    test_custom_hierarchy_3level();
+    test_hierarchy_rank_width();
+    test_arena_basic();
+    test_arena_co_location();
 
     printf("\n  %d/%d tests passed.\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

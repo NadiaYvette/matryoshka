@@ -37,11 +37,14 @@
 
 #define MT_PAGE_SIZE       4096
 
-/* FAST blocking depths (same as FAST) */
+/* FAST blocking depths (defaults for x86-64) */
 #define MT_DK              2       /* SIMD block depth */
 #define MT_NK              3       /* Keys per SIMD block (2^DK - 1) */
 #define MT_DL              4       /* Cache-line block depth */
 #define MT_NL              15      /* Keys per cache-line block */
+
+/* Maximum hierarchy levels (SIMD, CL, page, superpage, ...) */
+#define MT_MAX_LEVELS      8
 
 /* Internal node capacity.
    Header = 16 B.  Per key: 4 B key + 8 B pointer = 12 B, plus 1 extra ptr.
@@ -50,14 +53,53 @@
 #define MT_MAX_IKEYS       339
 #define MT_MIN_IKEYS       ((MT_MAX_IKEYS) / 2)   /* B+ tree min fill */
 
-/* Leaf node capacity.
-   Header = 24 B (type, nkeys, tree_depth, pad, prev, next).
-   Tree arrays: layout[512] (int32_t) + sorted_rank[512] (int16_t).
+/* Default leaf node capacity (for 4 KiB pages with int16_t rank).
+   Header = 24 B.  layout[512] (int32_t) + sorted_rank[512] (int16_t).
    24 + 512*4 + 512*2 = 3096 ≤ 4096.
    Max tree depth = 9, tree_nodes = 511, max actual keys = 511. */
-#define MT_LNODE_TREE_CAP  512      /* Array capacity (≥ max tree nodes) */
+#define MT_LNODE_TREE_CAP  512      /* Default array capacity */
 #define MT_MAX_LKEYS       511
 #define MT_MIN_LKEYS       ((MT_MAX_LKEYS) / 2)
+
+/* ── Hierarchy configuration ───────────────────────────────── */
+
+/* Per-level descriptor: one blocking level in the memory hierarchy. */
+typedef struct {
+    int      depth;     /* Tree depth of this blocking level (e.g. 2 for SIMD) */
+    size_t   hw_size;   /* Hardware unit in bytes (16, 64, 4096, 2MiB, ...) */
+} mt_level_t;
+
+/* Full hierarchy (finest → coarsest). */
+typedef struct mt_hierarchy {
+    mt_level_t levels[MT_MAX_LEVELS];
+    int        num_levels;
+    size_t     leaf_alloc;   /* Allocation size for a leaf chunk (page/superpage) */
+    int        leaf_depth;   /* Max tree depth within a leaf chunk */
+    int        leaf_cap;     /* Max keys per leaf chunk (2^leaf_depth - 1) */
+    int        tree_cap;     /* Array capacity (2^leaf_depth, includes padding) */
+    int        min_lkeys;    /* Minimum leaf occupancy (leaf_cap / 2) */
+    bool       rank_wide;    /* true if sorted_rank needs int32_t (leaf_cap > 32767) */
+} mt_hierarchy_t;
+
+/* ── Arena allocator types ──────────────────────────────────── */
+
+/* A single superpage-aligned arena of contiguous memory. */
+typedef struct mt_arena {
+    void            *base;       /* Arena base pointer (superpage-aligned) */
+    size_t           size;       /* Total arena size in bytes */
+    size_t           page_size;  /* Sub-allocation unit size */
+    int              num_pages;  /* Number of sub-pages in this arena */
+    bool             is_mmap;    /* Was allocated via mmap (vs posix_memalign) */
+    uint64_t        *bitmap;     /* Allocation bitmap (points after this struct) */
+    struct mt_arena *next;       /* Linked list of arenas */
+} mt_arena_t;
+
+/* Arena allocator: manages a linked list of arenas. */
+typedef struct mt_allocator {
+    mt_arena_t *arenas;          /* Linked list of arenas */
+    size_t      arena_size;      /* Size of each arena (superpage size) */
+    size_t      page_size;       /* Sub-allocation size (page size) */
+} mt_allocator_t;
 
 /* SIMD lookup table (same as FAST). */
 static const int MT_SIMD_LOOKUP[16] = {
@@ -123,9 +165,11 @@ typedef union mt_node {
 /* ── Tree root ──────────────────────────────────────────────── */
 
 struct matryoshka_tree {
-    mt_node_t *root;
-    size_t     n;            /* Total number of keys */
-    int        height;       /* Tree height (0 = single leaf) */
+    mt_node_t      *root;
+    size_t          n;            /* Total number of keys */
+    int             height;       /* Tree height (0 = single leaf) */
+    mt_hierarchy_t  hier;         /* Blocking hierarchy configuration */
+    mt_allocator_t *alloc;        /* Arena allocator for leaf nodes (may be NULL) */
 };
 
 /* ── Iterator ───────────────────────────────────────────────── */
@@ -138,26 +182,58 @@ struct matryoshka_iter {
     int32_t                  sorted[MT_MAX_LKEYS]; /* Sorted keys extracted from leaf */
 };
 
+/* ── Hierarchy factory functions ───────────────────────────── */
+
+/* Initialise a hierarchy with the default x86-64 configuration:
+   SIMD (d=2, 16B) + cache-line (d=4, 64B), 4 KiB page leaves. */
+void mt_hierarchy_init_default(mt_hierarchy_t *h);
+
+/* Initialise a hierarchy with superpage leaves:
+   SIMD (d=2) + CL (d=4) + page (d=10), 2 MiB superpage leaves. */
+void mt_hierarchy_init_superpage(mt_hierarchy_t *h);
+
+/* Initialise a custom hierarchy from a levels array.
+   levels[0] is the finest (SIMD), levels[num_levels-1] the coarsest.
+   leaf_alloc is the allocation size for leaf chunks. */
+void mt_hierarchy_init_custom(mt_hierarchy_t *h, const mt_level_t *levels,
+                               int num_levels, size_t leaf_alloc);
+
 /* ── Internal functions (implemented in separate .c files) ──── */
 
-/* Leaf FAST layout: build blocked layout from sorted keys within a leaf. */
-void mt_leaf_build(mt_lnode_t *leaf, const int32_t *sorted_keys, int nkeys);
+/* Leaf FAST layout: build blocked layout from sorted keys within a leaf.
+   Uses the hierarchy's blocking depths. */
+void mt_leaf_build(mt_lnode_t *leaf, const int32_t *sorted_keys, int nkeys,
+                   const mt_hierarchy_t *hier);
 
 /* Extract sorted keys from a leaf's FAST blocked layout into `out`.
-   `out` must have room for at least leaf->nkeys elements. */
-void mt_leaf_extract_sorted(const mt_lnode_t *leaf, int32_t *out);
+   `out` must have room for at least leaf->nkeys elements.
+   Uses the hierarchy's tree_cap for the iteration bound. */
+void mt_leaf_extract_sorted(const mt_lnode_t *leaf, int32_t *out,
+                             const mt_hierarchy_t *hier);
 
 /* Leaf FAST search: predecessor search within a single leaf.
+   Uses the hierarchy's blocking depths.
    Returns sorted index within the leaf, or -1. */
-int mt_leaf_search(const mt_lnode_t *leaf, int32_t key);
+int mt_leaf_search(const mt_lnode_t *leaf, int32_t key,
+                   const mt_hierarchy_t *hier);
 
 /* Internal node search: find child index for the given key.
    Returns i such that children[i] should be followed. */
 int mt_inode_search(const mt_inode_t *node, int32_t key);
 
-/* Node allocation (page-aligned). */
+/* Node allocation.
+   mt_alloc_lnode: if alloc is non-NULL, allocates from the arena.
+   mt_free_lnode: if alloc is non-NULL, returns to the arena.
+   mt_alloc_inode / mt_free_inode: always use posix_memalign/free. */
 mt_node_t *mt_alloc_inode(void);
-mt_node_t *mt_alloc_lnode(void);
-void mt_free_node(mt_node_t *node);
+mt_node_t *mt_alloc_lnode(const mt_hierarchy_t *hier, mt_allocator_t *alloc);
+void mt_free_inode(mt_node_t *node);
+void mt_free_lnode(mt_node_t *node, mt_allocator_t *alloc);
+
+/* Arena allocator. */
+mt_allocator_t *mt_allocator_create(size_t arena_size, size_t page_size);
+void            mt_allocator_destroy(mt_allocator_t *alloc);
+void           *mt_allocator_alloc(mt_allocator_t *alloc);
+void            mt_allocator_free(mt_allocator_t *alloc, void *ptr);
 
 #endif /* MATRYOSHKA_INTERNAL_H */

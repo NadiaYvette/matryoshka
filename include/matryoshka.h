@@ -32,14 +32,26 @@ extern "C" {
 /* Opaque tree handle. */
 typedef struct matryoshka_tree matryoshka_tree_t;
 
+/* Forward declare hierarchy types for the _with variants.
+   Full definitions are in matryoshka_internal.h. */
+typedef struct mt_hierarchy mt_hierarchy_t;
+
 /* ── Lifecycle ──────────────────────────────────────────────── */
 
-/* Create an empty tree. */
+/* Create an empty tree (default x86-64 hierarchy). */
 matryoshka_tree_t *matryoshka_create(void);
 
-/* Create a tree bulk-loaded from sorted keys.  Keys must be in ascending
-   order with no duplicates.  O(n) construction. */
+/* Create an empty tree with a specific hierarchy configuration. */
+matryoshka_tree_t *matryoshka_create_with(const mt_hierarchy_t *hier);
+
+/* Create a tree bulk-loaded from sorted keys (default hierarchy).
+   Keys must be in ascending order with no duplicates.  O(n) construction. */
 matryoshka_tree_t *matryoshka_bulk_load(const int32_t *sorted_keys, size_t n);
+
+/* Bulk-load with a specific hierarchy configuration. */
+matryoshka_tree_t *matryoshka_bulk_load_with(const int32_t *sorted_keys,
+                                              size_t n,
+                                              const mt_hierarchy_t *hier);
 
 /* Destroy a tree and free all associated memory. */
 void matryoshka_destroy(matryoshka_tree_t *tree);

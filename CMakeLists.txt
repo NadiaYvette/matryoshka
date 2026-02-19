@@ -13,6 +13,8 @@ add_library(matryoshka STATIC
     src/leaf.c
     src/inode.c
     src/alloc.c
+    src/hierarchy.c
+    src/arena.c
 )
 target_include_directories(matryoshka PUBLIC include)
 
