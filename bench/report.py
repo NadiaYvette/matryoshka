@@ -43,7 +43,7 @@ import jinja2
 
 ROOT = Path(__file__).resolve().parent.parent
 
-LIBRARIES = ["matryoshka", "std_set", "tlx_btree", "libart"]
+LIBRARIES = ["matryoshka", "matryoshka_fence", "std_set", "tlx_btree", "libart"]
 WORKLOADS = [
     "seq_insert", "rand_insert", "rand_delete",
     "mixed", "ycsb_a", "ycsb_b", "search_after_churn",
@@ -51,27 +51,30 @@ WORKLOADS = [
 DEFAULT_SIZES = [65536, 262144, 1048576, 4194304, 16777216]
 
 LIBRARY_COLORS = {
-    "matryoshka":    "#2980b9",  # blue
-    "std_set":       "#e74c3c",  # red
-    "tlx_btree":     "#8e44ad",  # purple
-    "libart":        "#f39c12",  # orange
-    "abseil_btree":  "#27ae60",  # green
+    "matryoshka":       "#2980b9",  # blue
+    "matryoshka_fence": "#1a5276",  # dark blue
+    "std_set":          "#e74c3c",  # red
+    "tlx_btree":        "#8e44ad",  # purple
+    "libart":           "#f39c12",  # orange
+    "abseil_btree":     "#27ae60",  # green
 }
 
 LIBRARY_LABELS = {
-    "matryoshka":    "Matryoshka B+ tree",
-    "std_set":       "std::set (RB tree)",
-    "tlx_btree":     "TLX btree\\_set",
-    "libart":        "libart (ART)",
-    "abseil_btree":  "Abseil btree\\_set",
+    "matryoshka":       "Matryoshka B+ tree",
+    "matryoshka_fence": "Matryoshka + fence keys",
+    "std_set":          "std::set (RB tree)",
+    "tlx_btree":        "TLX btree\\_set",
+    "libart":           "libart (ART)",
+    "abseil_btree":     "Abseil btree\\_set",
 }
 
 LIBRARY_LABELS_PLAIN = {
-    "matryoshka":    "Matryoshka B+ tree",
-    "std_set":       "std::set (RB tree)",
-    "tlx_btree":     "TLX btree_set",
-    "libart":        "libart (ART)",
-    "abseil_btree":  "Abseil btree_set",
+    "matryoshka":       "Matryoshka B+ tree",
+    "matryoshka_fence": "Matryoshka + fence keys",
+    "std_set":          "std::set (RB tree)",
+    "tlx_btree":        "TLX btree_set",
+    "libart":           "libart (ART)",
+    "abseil_btree":     "Abseil btree_set",
 }
 
 WORKLOAD_LABELS = {
@@ -713,11 +716,12 @@ def make_hw_counter_chart(perf_data, libraries, chart_dir):
 # ── LaTeX Template Loading & Compilation ─────────────────────────
 
 LIBRARY_DESCRIPTIONS = {
-    "matryoshka":   "B+ tree with nested CL sub-tree leaves (up to 855 keys/page), SIMD search, hugepage arena",
-    "std_set":      "Red-black tree (libstdc++), pointer-chasing, 40--48\\,B/node",
-    "tlx_btree":    "Cache-conscious B+ tree, sorted-array leaves ($B{\\approx}128$)",
-    "libart":       "Adaptive Radix Tree, 4-byte keys, no predecessor search",
-    "abseil_btree": "Google B-tree, sorted-array leaves ($B{\\approx}256$)",
+    "matryoshka":       "B+ tree with nested CL sub-tree leaves (up to 855 keys/page), SIMD search, hugepage arena",
+    "matryoshka_fence": "Matryoshka + fence keys in page header + mass prefetch of all fence children",
+    "std_set":          "Red-black tree (libstdc++), pointer-chasing, 40--48\\,B/node",
+    "tlx_btree":        "Cache-conscious B+ tree, sorted-array leaves ($B{\\approx}128$)",
+    "libart":           "Adaptive Radix Tree, 4-byte keys, no predecessor search",
+    "abseil_btree":     "Google B-tree, sorted-array leaves ($B{\\approx}256$)",
 }
 
 
@@ -829,9 +833,10 @@ def _compute_analysis_vars(results, perf_data, profile_top, libraries, sizes):
     competitors = [lib for lib in libraries if lib != "matryoshka"]
 
     # ── Per-library throughput at largest and smallest sizes ──
-    all_libs = ["matryoshka", "std_set", "tlx_btree", "libart", "abseil_btree"]
+    all_libs = ["matryoshka", "matryoshka_fence", "std_set", "tlx_btree", "libart", "abseil_btree"]
     lib_short = {
-        "matryoshka": "mat", "std_set": "stdset", "tlx_btree": "tlx",
+        "matryoshka": "mat", "matryoshka_fence": "matfence",
+        "std_set": "stdset", "tlx_btree": "tlx",
         "libart": "art", "abseil_btree": "abseil",
     }
     workloads = ["seq_insert", "rand_insert", "rand_delete", "mixed",
@@ -944,12 +949,13 @@ def _compute_analysis_vars(results, perf_data, profile_top, libraries, sizes):
             })
     ctx["hw_rows"] = hw_rows
 
-    # Legacy scalar values (backward compat)
-    ctx["matryoshka_dtlb_miss_rate"] = _perf_rate("matryoshka", "dTLB-load-misses", "dTLB-loads")
+    # Legacy scalar values (backward compat) — prefer fence variant if available
+    mat_perf = "matryoshka_fence" if (perf_data and "matryoshka_fence" in perf_data) else "matryoshka"
+    ctx["matryoshka_dtlb_miss_rate"] = _perf_rate(mat_perf, "dTLB-load-misses", "dTLB-loads")
     ctx["stdset_dtlb_miss_rate"] = _perf_rate("std_set", "dTLB-load-misses", "dTLB-loads")
-    ctx["matryoshka_llc_miss_rate"] = _perf_rate("matryoshka", "LLC-load-misses", "LLC-loads")
+    ctx["matryoshka_llc_miss_rate"] = _perf_rate(mat_perf, "LLC-load-misses", "LLC-loads")
     ctx["stdset_llc_miss_rate"] = _perf_rate("std_set", "LLC-load-misses", "LLC-loads")
-    ctx["matryoshka_ipc"] = _perf_ipc("matryoshka")
+    ctx["matryoshka_ipc"] = _perf_ipc(mat_perf)
 
     # Profile: percentage in mt_page_insert
     ctx["pct_leaf_build"] = "N/A"
@@ -1183,10 +1189,11 @@ def main():
         if profile_size not in sizes:
             # Use the largest size available
             profile_size = max(sizes)
-        print(f"\nRunning perf record on matryoshka/rand_insert "
+        profile_lib = "matryoshka_fence" if "matryoshka_fence" in available_libs else "matryoshka"
+        print(f"\nRunning perf record on {profile_lib}/rand_insert "
               f"N={fmt_size(profile_size)}...", flush=True)
         profile_top = run_perf_record(
-            bench_binary, "matryoshka", "rand_insert", profile_size)
+            bench_binary, profile_lib, "rand_insert", profile_size)
         if profile_top:
             print(f"  Captured {len(profile_top)} hot functions.")
             for pct, sym in profile_top[:5]:
@@ -1200,10 +1207,11 @@ def main():
         cm_size = 4194304
         if cm_size not in sizes:
             cm_size = max(sizes)
-        print(f"\nRunning perf record -e cache-misses on matryoshka/rand_insert "
+        cm_lib = "matryoshka_fence" if "matryoshka_fence" in available_libs else "matryoshka"
+        print(f"\nRunning perf record -e cache-misses on {cm_lib}/rand_insert "
               f"N={fmt_size(cm_size)}...", flush=True)
         cache_miss_top = run_perf_cache_misses(
-            bench_binary, "matryoshka", "rand_insert", cm_size)
+            bench_binary, cm_lib, "rand_insert", cm_size)
         if cache_miss_top:
             print(f"  Captured {len(cache_miss_top)} cache-miss functions.")
             for pct, sym in cache_miss_top[:5]:

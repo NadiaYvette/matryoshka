@@ -479,7 +479,7 @@ Matryoshka rows highlighted in \colorbox{rowhl}{blue}.
 \bottomrule
 \endlastfoot
 \BLOCK{for r in results}
-\BLOCK{if r.library == 'matryoshka'}
+\BLOCK{if r.library == 'matryoshka' or r.library == 'matryoshka\_fence'}
 \rowcolor{rowhl}
 \BLOCK{endif}
 \texttt{\VAR{r.library}} & \texttt{\VAR{r.workload}} &
@@ -800,7 +800,7 @@ designs.
   & \textbf{(/1K ops)} & \textbf{(\%)} & \\
 \midrule
 \BLOCK{for row in hw_rows}
-\BLOCK{if row.name == 'matryoshka'}
+\BLOCK{if row.name == 'matryoshka' or row.name == 'matryoshka\_fence'}
 \rowcolor{rowhl}
 \BLOCK{endif}
 \texttt{\VAR{row.name}} & \VAR{row.cache_miss_pct}
