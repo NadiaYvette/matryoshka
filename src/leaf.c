@@ -438,19 +438,24 @@ static int page_find_leaf(const mt_lnode_t *page, int32_t key,
     /* ── Fence key fast path: use separator data already in the
        header cache line to skip the CL root internal. ────────── */
     if (height > 0 && page->header.nfence > 0) {
-        int ci = fence_search(page->header.fence_keys,
-                              page->header.nfence, key);
+        /* Prefetch ALL fence children before searching.  All slots
+           live in this 4 KiB page (single TLB entry), so spurious
+           prefetches cost only L1/L2 fill bandwidth.  The fence
+           search (≤6 comparisons) provides the latency window. */
+        int nf = page->header.nfence;
+        for (int c = 0; c <= nf; c++)
+            __builtin_prefetch(get_slot_c(page,
+                               page->header.fence_slots[c]), 0, 1);
+
+        int ci = fence_search(page->header.fence_keys, nf, key);
         path[0].slot = (uint8_t)slot;
         path[0].child_idx = (uint8_t)ci;
         (*path_len)++;
         slot = page->header.fence_slots[ci];
 
-        if (height == 1) {
-            __builtin_prefetch(get_slot_c(page, slot), 0, 1);
-            return slot;
-        }
+        if (height == 1)
+            return slot;  /* mass prefetch already covers this child */
         /* Height 2: skipped root, continue from level-1 internal. */
-        __builtin_prefetch(get_slot_c(page, slot), 0, 1);
         for (int i = 1; i < height; i++) {
             const mt_cl_slot_t *s = get_slot_c(page, slot);
             ci = cl_inode_search(&s->inode, key);
