@@ -1,10 +1,10 @@
 /*
- * matryoshka.c — B+ tree operations with FAST-blocked leaf nodes.
+ * matryoshka.c — B+ tree operations with matryoshka-nested leaf nodes.
  *
  * Core operations: create, bulk_load, destroy, search, insert, delete,
- * and iteration.  Leaf nodes use hierarchical FAST blocking for search;
- * modifications rebuild the affected leaf in O(B) time, giving overall
- * O(B · log_B n) modification cost.
+ * and iteration.  Leaf nodes contain a B+ sub-tree of cache-line-sized
+ * sub-nodes, giving O(log b) intra-node operations instead of O(B)
+ * flat-array rebuilds.
  */
 
 #include "matryoshka_internal.h"
@@ -14,6 +14,9 @@
 /* ── Constants ────────────────────────────────────────────────── */
 
 #define MT_MAX_HEIGHT 32
+
+/* Absolute maximum keys extractable from a page (all 63 slots as leaves). */
+#define MT_MAX_PAGE_KEYS (MT_PAGE_SLOTS * MT_CL_KEY_CAP)  /* 945 */
 
 /* ── Path tracking for insert/delete ──────────────────────────── */
 
@@ -38,39 +41,6 @@ static mt_lnode_t *find_leaf(mt_node_t *root, int height, int32_t key,
         node = in->children[idx];
     }
     return &node->lnode;
-}
-
-/* Insert a key at position `pos` in a sorted array of `n` elements.
-   Returns the insertion index, or -1 if the key already exists. */
-static int sorted_insert(int32_t *arr, int n, int32_t key)
-{
-    int lo = 0, hi = n;
-    while (lo < hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (arr[mid] < key) lo = mid + 1;
-        else hi = mid;
-    }
-    if (lo < n && arr[lo] == key)
-        return -1;
-    memmove(arr + lo + 1, arr + lo, (size_t)(n - lo) * sizeof(int32_t));
-    arr[lo] = key;
-    return lo;
-}
-
-/* Remove a key from a sorted array of `n` elements.
-   Returns the removed index, or -1 if not found. */
-static int sorted_remove(int32_t *arr, int n, int32_t key)
-{
-    int lo = 0, hi = n;
-    while (lo < hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (arr[mid] < key) lo = mid + 1;
-        else hi = mid;
-    }
-    if (lo >= n || arr[lo] != key)
-        return -1;
-    memmove(arr + lo, arr + lo + 1, (size_t)(n - lo - 1) * sizeof(int32_t));
-    return lo;
 }
 
 /* Insert a separator key and right child pointer into an internal node
@@ -100,6 +70,18 @@ static void inode_remove_at(mt_inode_t *node, int pos)
     node->nkeys = (uint16_t)(n - 1);
 }
 
+/* Get the maximum key in a leaf page by walking to the rightmost CL leaf. */
+static int32_t page_max_key(const mt_lnode_t *page)
+{
+    int slot = page->header.root_slot;
+    const mt_cl_slot_t *s = &page->slots[slot - 1];
+    while (s->type == MT_CL_INTERNAL) {
+        slot = s->inode.children[s->inode.nkeys];
+        s = &page->slots[slot - 1];
+    }
+    return (s->leaf.nkeys > 0) ? s->leaf.keys[s->leaf.nkeys - 1] : MT_KEY_MAX;
+}
+
 /* ── Lifecycle ────────────────────────────────────────────────── */
 
 matryoshka_tree_t *matryoshka_create_with(const mt_hierarchy_t *hier)
@@ -126,6 +108,7 @@ matryoshka_tree_t *matryoshka_create_with(const mt_hierarchy_t *hier)
         free(tree);
         return NULL;
     }
+    mt_page_init(&tree->root->lnode);
     return tree;
 }
 
@@ -183,10 +166,11 @@ matryoshka_tree_t *matryoshka_bulk_load_with(const int32_t *sorted_keys,
         tree->alloc = NULL;
     }
 
-    int max_lkeys = hier->leaf_cap;
+    int max_lkeys = hier->page_max_keys;
 
     if (n == 0) {
         tree->root = mt_alloc_lnode(&tree->hier, tree->alloc);
+        mt_page_init(&tree->root->lnode);
         tree->height = 0;
         return tree;
     }
@@ -203,7 +187,7 @@ matryoshka_tree_t *matryoshka_bulk_load_with(const int32_t *sorted_keys,
     for (size_t i = 0; i < nleaves; i++) {
         size_t k = keys_per + (i < extra ? 1 : 0);
         mt_node_t *lnode = mt_alloc_lnode(&tree->hier, tree->alloc);
-        mt_leaf_build(&lnode->lnode, sorted_keys + offset, (int)k, &tree->hier);
+        mt_page_bulk_load(&lnode->lnode, sorted_keys + offset, (int)k);
         entries[i].node = lnode;
         entries[i].min_key = sorted_keys[offset];
         offset += k;
@@ -212,8 +196,8 @@ matryoshka_tree_t *matryoshka_bulk_load_with(const int32_t *sorted_keys,
     /* Link leaves. */
     for (size_t i = 0; i < nleaves; i++) {
         mt_lnode_t *l = &entries[i].node->lnode;
-        l->prev = (i > 0) ? &entries[i - 1].node->lnode : NULL;
-        l->next = (i < nleaves - 1) ? &entries[i + 1].node->lnode : NULL;
+        l->header.prev = (i > 0) ? &entries[i - 1].node->lnode : NULL;
+        l->header.next = (i < nleaves - 1) ? &entries[i + 1].node->lnode : NULL;
     }
 
     /* Build internal levels bottom-up. */
@@ -294,22 +278,15 @@ bool matryoshka_search(const matryoshka_tree_t *tree, int32_t key,
 
     mt_lnode_t *leaf = &node->lnode;
 
-    /* Predecessor search using FAST layout. */
-    int pos = mt_leaf_search(leaf, key, &tree->hier);
-    if (pos >= 0) {
-        int32_t sorted[MT_MAX_LKEYS];
-        mt_leaf_extract_sorted(leaf, sorted, &tree->hier);
-        if (result) *result = sorted[pos];
+    /* Predecessor search within the page sub-tree. */
+    if (mt_page_search_key(leaf, key, result))
         return true;
-    }
 
     /* Key is smaller than all keys in this leaf.  Check previous leaf. */
-    if (leaf->prev) {
-        mt_lnode_t *prev = leaf->prev;
-        if (prev->nkeys > 0) {
-            int32_t sorted[MT_MAX_LKEYS];
-            mt_leaf_extract_sorted(prev, sorted, &tree->hier);
-            if (result) *result = sorted[prev->nkeys - 1];
+    if (leaf->header.prev) {
+        mt_lnode_t *prev = leaf->header.prev;
+        if (prev->header.nkeys > 0) {
+            if (result) *result = page_max_key(prev);
             return true;
         }
     }
@@ -319,10 +296,17 @@ bool matryoshka_search(const matryoshka_tree_t *tree, int32_t key,
 
 bool matryoshka_contains(const matryoshka_tree_t *tree, int32_t key)
 {
-    int32_t found;
-    if (!matryoshka_search(tree, key, &found))
+    if (!tree || tree->n == 0)
         return false;
-    return found == key;
+
+    /* Walk to leaf. */
+    mt_node_t *node = tree->root;
+    for (int i = 0; i < tree->height; i++) {
+        int idx = mt_inode_search(&node->inode, key);
+        node = node->inode.children[idx];
+    }
+
+    return mt_page_contains(&node->lnode, key);
 }
 
 /* ── Insert ───────────────────────────────────────────────────── */
@@ -335,43 +319,38 @@ bool matryoshka_insert(matryoshka_tree_t *tree, int32_t key)
     mt_path_t path[MT_MAX_HEIGHT];
     mt_lnode_t *leaf = find_leaf(tree->root, tree->height, key, path);
 
-    /* Extract sorted keys. */
-    int32_t sorted[MT_MAX_LKEYS + 1];
-    int n = leaf->nkeys;
-    mt_leaf_extract_sorted(leaf, sorted, &tree->hier);
+    /* Try inserting into the page sub-tree. */
+    mt_status_t status = mt_page_insert(leaf, key);
 
-    /* Insert into sorted array. */
-    int ins = sorted_insert(sorted, n, key);
-    if (ins < 0)
-        return false;  /* duplicate */
-    n++;
+    if (status == MT_DUPLICATE)
+        return false;
 
-    int max_lkeys = tree->hier.leaf_cap;
-    if (n <= max_lkeys) {
-        mt_leaf_build(leaf, sorted, n, &tree->hier);
+    if (status == MT_OK) {
         tree->n++;
         return true;
     }
 
-    /* Leaf overflow: split. */
-    int left_n = n / 2;
-    int right_n = n - left_n;
-
+    /* MT_PAGE_FULL: split the leaf page. */
     mt_node_t *new_rnode = mt_alloc_lnode(&tree->hier, tree->alloc);
     mt_lnode_t *new_right = &new_rnode->lnode;
 
-    mt_leaf_build(leaf, sorted, left_n, &tree->hier);
-    mt_leaf_build(new_right, sorted + left_n, right_n, &tree->hier);
+    int32_t sep = mt_page_split(leaf, new_right);
+
+    /* Insert the key into the appropriate half. */
+    if (key < sep)
+        mt_page_insert(leaf, key);
+    else
+        mt_page_insert(new_right, key);
 
     /* Maintain linked list. */
-    new_right->next = leaf->next;
-    new_right->prev = leaf;
-    if (leaf->next)
-        leaf->next->prev = new_right;
-    leaf->next = new_right;
+    new_right->header.next = leaf->header.next;
+    new_right->header.prev = leaf;
+    if (leaf->header.next)
+        leaf->header.next->header.prev = new_right;
+    leaf->header.next = new_right;
 
     /* Separator = first key of the right leaf. */
-    int32_t sep = sorted[left_n];
+    sep = mt_page_min_key(new_right);
     mt_node_t *right_child = new_rnode;
 
     /* Propagate split up through internal nodes. */
@@ -453,36 +432,41 @@ bool matryoshka_insert(matryoshka_tree_t *tree, int32_t key)
 static void rebalance_leaf(matryoshka_tree_t *tree, mt_path_t *path,
                             mt_lnode_t *leaf, int level)
 {
-    const mt_hierarchy_t *hier = &tree->hier;
     mt_inode_t *parent = path[level].node;
     int cidx = path[level].idx;
-    int min_lkeys = hier->min_lkeys;
+    int min_page = tree->hier.min_page_keys;
 
     /* Try redistribute from left sibling. */
     if (cidx > 0) {
         mt_lnode_t *left = &parent->children[cidx - 1]->lnode;
-        if (left->nkeys > min_lkeys) {
-            /* Extract both leaves' sorted keys. */
-            int32_t lsorted[MT_MAX_LKEYS], rsorted[MT_MAX_LKEYS];
-            int ln = left->nkeys, rn = leaf->nkeys;
-            mt_leaf_extract_sorted(left, lsorted, hier);
-            mt_leaf_extract_sorted(leaf, rsorted, hier);
+        if (left->header.nkeys > min_page) {
+            int32_t lsorted[MT_MAX_PAGE_KEYS], rsorted[MT_MAX_PAGE_KEYS];
+            int ln = mt_page_extract_sorted(left, lsorted);
+            int rn = mt_page_extract_sorted(leaf, rsorted);
 
-            /* Move keys until balanced: target = (ln + rn) / 2 per side. */
             int total = ln + rn;
             int new_ln = total / 2;
             int move = ln - new_ln;
 
-            /* Build combined array: move `move` keys from left to right. */
-            int32_t new_right[MT_MAX_LKEYS + 1];
+            int32_t new_right[MT_MAX_PAGE_KEYS];
             memcpy(new_right, lsorted + new_ln, (size_t)move * sizeof(int32_t));
             memcpy(new_right + move, rsorted, (size_t)rn * sizeof(int32_t));
             int new_rn = move + rn;
 
-            mt_leaf_build(left, lsorted, new_ln, hier);
-            mt_leaf_build(leaf, new_right, new_rn, hier);
+            /* Save linked list pointers (bulk_load zeroes the page). */
+            struct mt_lnode *lp = left->header.prev;
+            struct mt_lnode *ln_next = left->header.next;
+            struct mt_lnode *rp = leaf->header.prev;
+            struct mt_lnode *rn_next = leaf->header.next;
 
-            /* Update separator: new sep = first key of right leaf. */
+            mt_page_bulk_load(left, lsorted, new_ln);
+            mt_page_bulk_load(leaf, new_right, new_rn);
+
+            left->header.prev = lp;
+            left->header.next = ln_next;
+            leaf->header.prev = rp;
+            leaf->header.next = rn_next;
+
             parent->keys[cidx - 1] = new_right[0];
             return;
         }
@@ -491,30 +475,37 @@ static void rebalance_leaf(matryoshka_tree_t *tree, mt_path_t *path,
     /* Try redistribute from right sibling. */
     if (cidx < parent->nkeys) {
         mt_lnode_t *right = &parent->children[cidx + 1]->lnode;
-        if (right->nkeys > min_lkeys) {
-            int32_t lsorted[MT_MAX_LKEYS], rsorted[MT_MAX_LKEYS];
-            int ln = leaf->nkeys, rn = right->nkeys;
-            mt_leaf_extract_sorted(leaf, lsorted, hier);
-            mt_leaf_extract_sorted(right, rsorted, hier);
+        if (right->header.nkeys > min_page) {
+            int32_t lsorted[MT_MAX_PAGE_KEYS], rsorted[MT_MAX_PAGE_KEYS];
+            int ln = mt_page_extract_sorted(leaf, lsorted);
+            int rn = mt_page_extract_sorted(right, rsorted);
 
             int total = ln + rn;
             int new_ln = total / 2;
             int move = new_ln - ln;
 
-            /* Move `move` keys from right to left. */
-            int32_t new_left[MT_MAX_LKEYS + 1];
+            int32_t new_left[MT_MAX_PAGE_KEYS];
             memcpy(new_left, lsorted, (size_t)ln * sizeof(int32_t));
             memcpy(new_left + ln, rsorted, (size_t)move * sizeof(int32_t));
 
-            int32_t new_right_keys[MT_MAX_LKEYS];
+            int32_t new_right_keys[MT_MAX_PAGE_KEYS];
             int new_rn = rn - move;
             memcpy(new_right_keys, rsorted + move,
                    (size_t)new_rn * sizeof(int32_t));
 
-            mt_leaf_build(leaf, new_left, new_ln, hier);
-            mt_leaf_build(right, new_right_keys, new_rn, hier);
+            struct mt_lnode *lp = leaf->header.prev;
+            struct mt_lnode *ln_next = leaf->header.next;
+            struct mt_lnode *rp = right->header.prev;
+            struct mt_lnode *rn_next = right->header.next;
 
-            /* Update separator: new sep = first key of right leaf. */
+            mt_page_bulk_load(leaf, new_left, new_ln);
+            mt_page_bulk_load(right, new_right_keys, new_rn);
+
+            leaf->header.prev = lp;
+            leaf->header.next = ln_next;
+            right->header.prev = rp;
+            right->header.next = rn_next;
+
             parent->keys[cidx] = new_right_keys[0];
             return;
         }
@@ -523,44 +514,47 @@ static void rebalance_leaf(matryoshka_tree_t *tree, mt_path_t *path,
     /* Cannot redistribute — merge.  Prefer merging with left sibling. */
     if (cidx > 0) {
         mt_lnode_t *left = &parent->children[cidx - 1]->lnode;
-        int32_t lsorted[MT_MAX_LKEYS], rsorted[MT_MAX_LKEYS];
-        int ln = left->nkeys, rn = leaf->nkeys;
-        mt_leaf_extract_sorted(left, lsorted, hier);
-        mt_leaf_extract_sorted(leaf, rsorted, hier);
+        int32_t lsorted[MT_MAX_PAGE_KEYS], rsorted[MT_MAX_PAGE_KEYS];
+        int ln = mt_page_extract_sorted(left, lsorted);
+        int rn = mt_page_extract_sorted(leaf, rsorted);
 
-        int32_t merged[MT_MAX_LKEYS + 1];
+        int32_t merged[MT_MAX_PAGE_KEYS];
         memcpy(merged, lsorted, (size_t)ln * sizeof(int32_t));
         memcpy(merged + ln, rsorted, (size_t)rn * sizeof(int32_t));
 
-        mt_leaf_build(left, merged, ln + rn, hier);
+        struct mt_lnode *lp = left->header.prev;
 
-        /* Unlink `leaf` from the doubly linked list. */
-        left->next = leaf->next;
-        if (leaf->next) leaf->next->prev = left;
+        mt_page_bulk_load(left, merged, ln + rn);
 
-        /* Remove `leaf` (child[cidx]) and separator keys[cidx-1]
-           from the parent. */
+        /* Restore and update linked list. */
+        left->header.prev = lp;
+        left->header.next = leaf->header.next;
+        if (leaf->header.next)
+            leaf->header.next->header.prev = left;
+
         inode_remove_at(parent, cidx - 1);
         mt_free_lnode((mt_node_t *)leaf, tree->alloc);
     } else {
         /* Merge with right sibling. */
         mt_lnode_t *right = &parent->children[cidx + 1]->lnode;
-        int32_t lsorted[MT_MAX_LKEYS], rsorted[MT_MAX_LKEYS];
-        int ln = leaf->nkeys, rn = right->nkeys;
-        mt_leaf_extract_sorted(leaf, lsorted, hier);
-        mt_leaf_extract_sorted(right, rsorted, hier);
+        int32_t lsorted[MT_MAX_PAGE_KEYS], rsorted[MT_MAX_PAGE_KEYS];
+        int ln = mt_page_extract_sorted(leaf, lsorted);
+        int rn = mt_page_extract_sorted(right, rsorted);
 
-        int32_t merged[MT_MAX_LKEYS + 1];
+        int32_t merged[MT_MAX_PAGE_KEYS];
         memcpy(merged, lsorted, (size_t)ln * sizeof(int32_t));
         memcpy(merged + ln, rsorted, (size_t)rn * sizeof(int32_t));
 
-        mt_leaf_build(leaf, merged, ln + rn, hier);
+        struct mt_lnode *lp = leaf->header.prev;
 
-        /* Unlink `right` from the doubly linked list. */
-        leaf->next = right->next;
-        if (right->next) right->next->prev = leaf;
+        mt_page_bulk_load(leaf, merged, ln + rn);
 
-        /* Remove right (child[cidx+1]) and separator keys[cidx]. */
+        /* Restore and update linked list. */
+        leaf->header.prev = lp;
+        leaf->header.next = right->header.next;
+        if (right->header.next)
+            right->header.next->header.prev = leaf;
+
         inode_remove_at(parent, cidx);
         mt_free_lnode((mt_node_t *)right, tree->alloc);
     }
@@ -593,7 +587,6 @@ static void rebalance_leaf(matryoshka_tree_t *tree, mt_path_t *path,
             if (lsib->nkeys > MT_MIN_IKEYS) {
                 /* Rotate right: pull separator from parent down,
                    push last key of left sibling up. */
-                /* Make room in node: shift keys/children right. */
                 memmove(node->keys + 1, node->keys,
                         (size_t)node->nkeys * sizeof(int32_t));
                 memmove(node->children + 1, node->children,
@@ -633,17 +626,17 @@ static void rebalance_leaf(matryoshka_tree_t *tree, mt_path_t *path,
         if (pi > 0) {
             /* Merge node into left sibling. */
             mt_inode_t *lsib = &pp->children[pi - 1]->inode;
-            int ln = lsib->nkeys;
+            int lnk = lsib->nkeys;
 
             /* Pull down separator from parent. */
-            lsib->keys[ln] = pp->keys[pi - 1];
+            lsib->keys[lnk] = pp->keys[pi - 1];
 
             /* Copy node's keys and children. */
-            memcpy(lsib->keys + ln + 1, node->keys,
+            memcpy(lsib->keys + lnk + 1, node->keys,
                    (size_t)node->nkeys * sizeof(int32_t));
-            memcpy(lsib->children + ln + 1, node->children,
+            memcpy(lsib->children + lnk + 1, node->children,
                    (size_t)(node->nkeys + 1) * sizeof(mt_node_t *));
-            lsib->nkeys = (uint16_t)(ln + 1 + node->nkeys);
+            lsib->nkeys = (uint16_t)(lnk + 1 + node->nkeys);
 
             /* Remove node (child[pi]) from parent. */
             inode_remove_at(pp, pi - 1);
@@ -677,26 +670,19 @@ bool matryoshka_delete(matryoshka_tree_t *tree, int32_t key)
     mt_path_t path[MT_MAX_HEIGHT];
     mt_lnode_t *leaf = find_leaf(tree->root, tree->height, key, path);
 
-    /* Extract sorted keys. */
-    int32_t sorted[MT_MAX_LKEYS];
-    int n = leaf->nkeys;
-    mt_leaf_extract_sorted(leaf, sorted, &tree->hier);
+    /* Delete from the page sub-tree. */
+    mt_status_t status = mt_page_delete(leaf, key, &tree->hier);
 
-    /* Remove key. */
-    int rem = sorted_remove(sorted, n, key);
-    if (rem < 0)
+    if (status == MT_NOT_FOUND)
         return false;
-    n--;
 
-    /* Rebuild the leaf. */
-    mt_leaf_build(leaf, sorted, n, &tree->hier);
     tree->n--;
 
-    /* If leaf is the root or has enough keys, we're done. */
-    if (tree->height == 0 || n >= tree->hier.min_lkeys)
+    /* If leaf is the root or no underflow, we're done. */
+    if (status == MT_OK || tree->height == 0)
         return true;
 
-    /* Leaf underflow: eager rebalance (Jannink). */
+    /* MT_UNDERFLOW: eager rebalance (Jannink). */
     rebalance_leaf(tree, path, leaf, tree->height - 1);
     return true;
 }
@@ -706,9 +692,15 @@ bool matryoshka_delete(matryoshka_tree_t *tree, int32_t key)
 /* Load sorted keys from the current leaf into the iterator's buffer. */
 static void iter_load_leaf(matryoshka_iter_t *iter)
 {
-    if (iter->leaf && iter->leaf->nkeys > 0) {
-        iter->nkeys = iter->leaf->nkeys;
-        mt_leaf_extract_sorted(iter->leaf, iter->sorted, &iter->tree->hier);
+    if (iter->leaf && iter->leaf->header.nkeys > 0) {
+        int nkeys = iter->leaf->header.nkeys;
+        int32_t *buf = realloc(iter->sorted, (size_t)nkeys * sizeof(int32_t));
+        if (buf) {
+            iter->sorted = buf;
+            iter->nkeys = mt_page_extract_sorted(iter->leaf, iter->sorted);
+        } else {
+            iter->nkeys = 0;
+        }
     } else {
         iter->nkeys = 0;
     }
@@ -722,6 +714,7 @@ matryoshka_iter_t *matryoshka_iter_from(const matryoshka_tree_t *tree,
     matryoshka_iter_t *iter = malloc(sizeof(*iter));
     if (!iter) return NULL;
     iter->tree = tree;
+    iter->sorted = NULL;
 
     if (tree->n == 0) {
         iter->leaf = NULL;
@@ -745,8 +738,8 @@ matryoshka_iter_t *matryoshka_iter_from(const matryoshka_tree_t *tree,
         pos++;
 
     /* If past the end of this leaf, move to the next one. */
-    if (pos >= iter->nkeys && iter->leaf->next) {
-        iter->leaf = iter->leaf->next;
+    if (pos >= iter->nkeys && iter->leaf->header.next) {
+        iter->leaf = iter->leaf->header.next;
         iter_load_leaf(iter);
         pos = 0;
     }
@@ -762,9 +755,9 @@ bool matryoshka_iter_next(matryoshka_iter_t *iter, int32_t *key)
 
     while (iter->pos >= iter->nkeys) {
         /* Move to next leaf. */
-        if (!iter->leaf->next)
+        if (!iter->leaf->header.next)
             return false;
-        iter->leaf = iter->leaf->next;
+        iter->leaf = iter->leaf->header.next;
         iter_load_leaf(iter);
         iter->pos = 0;
     }
@@ -776,5 +769,8 @@ bool matryoshka_iter_next(matryoshka_iter_t *iter, int32_t *key)
 
 void matryoshka_iter_destroy(matryoshka_iter_t *iter)
 {
-    free(iter);
+    if (iter) {
+        free(iter->sorted);
+        free(iter);
+    }
 }

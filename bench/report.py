@@ -803,11 +803,11 @@ def _compute_analysis_vars(results, perf_data, profile_top, libraries, sizes):
     else:
         ctx["matryoshka_ipc"] = "N/A"
 
-    # Profile: percentage in mt_leaf_build
+    # Profile: percentage in mt_page_insert (previously mt_leaf_build)
     ctx["pct_leaf_build"] = "N/A"
     if profile_top:
         for pct, sym in profile_top:
-            if "mt_leaf_build" in sym:
+            if "mt_page_insert" in sym or "mt_page_delete" in sym:
                 ctx["pct_leaf_build"] = f"{pct:.0f}"
                 break
 

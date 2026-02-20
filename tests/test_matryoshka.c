@@ -93,12 +93,12 @@ static void test_insert_descending(void)
 
 static void test_insert_split(void)
 {
-    TEST(insert_leaf_split_600);
+    TEST(insert_leaf_split_2000);
     matryoshka_tree_t *t = matryoshka_create();
-    for (int i = 0; i < 600; i++)
+    for (int i = 0; i < 2000; i++)
         ASSERT(matryoshka_insert(t, i * 2), "insert failed");
-    ASSERT(matryoshka_size(t) == 600, "wrong size");
-    for (int i = 0; i < 600; i++)
+    ASSERT(matryoshka_size(t) == 2000, "wrong size");
+    for (int i = 0; i < 2000; i++)
         ASSERT(matryoshka_contains(t, i * 2), "key not found after split");
     ASSERT(!matryoshka_contains(t, 1), "phantom key");
     matryoshka_destroy(t);
@@ -545,91 +545,45 @@ static void test_bulk_load_with_default(void)
     PASS();
 }
 
-/* ── Hierarchy: custom SIMD-only (single level) ──────────────── */
+/* ── Hierarchy: superpage configuration ──────────────────────── */
 
-static void test_custom_hierarchy_simd_only(void)
+static void test_hierarchy_superpage(void)
 {
-    TEST(custom_hierarchy_simd_only);
-    mt_level_t levels[1] = { { .depth = 2, .hw_size = 16 } };
-    mt_hierarchy_t hier;
-    mt_hierarchy_init_custom(&hier, levels, 1, MT_PAGE_SIZE);
-    ASSERT(hier.num_levels == 1, "wrong num_levels");
-    ASSERT(hier.leaf_cap > 0, "leaf_cap is 0");
-
-    matryoshka_tree_t *t = matryoshka_create_with(&hier);
-    ASSERT(t != NULL, "create_with returned NULL");
-    for (int i = 0; i < 400; i++)
-        ASSERT(matryoshka_insert(t, i * 3), "insert failed");
-    ASSERT(matryoshka_size(t) == 400, "wrong size");
-    for (int i = 0; i < 400; i++)
-        ASSERT(matryoshka_contains(t, i * 3), "key not found");
-    ASSERT(!matryoshka_contains(t, 1), "phantom key");
-    matryoshka_destroy(t);
-    PASS();
-}
-
-/* ── Hierarchy: 3-level (SIMD + CL + page) ───────────────────── */
-
-static void test_custom_hierarchy_3level(void)
-{
-    TEST(custom_hierarchy_3_levels);
-    mt_level_t levels[3] = {
-        { .depth = 2,  .hw_size = 16 },
-        { .depth = 4,  .hw_size = 64 },
-        { .depth = 3,  .hw_size = 4096 },
-    };
-    mt_hierarchy_t hier;
-    mt_hierarchy_init_custom(&hier, levels, 3, MT_PAGE_SIZE);
-    ASSERT(hier.num_levels == 3, "wrong num_levels");
-
-    int n = 5000;
-    int32_t *keys = malloc((size_t)n * sizeof(int32_t));
-    for (int i = 0; i < n; i++) keys[i] = i * 2;
-    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, (size_t)n, &hier);
-    ASSERT(t != NULL, "bulk_load_with returned NULL");
-    ASSERT(matryoshka_size(t) == (size_t)n, "wrong size");
-    for (int i = 0; i < n; i++)
-        ASSERT(matryoshka_contains(t, i * 2), "key not found");
-    ASSERT(!matryoshka_contains(t, 1), "phantom key");
-
-    /* Predecessor search. */
-    int32_t result;
-    ASSERT(matryoshka_search(t, 101, &result) && result == 100,
-           "pred(101) != 100");
-
-    matryoshka_destroy(t);
-    free(keys);
-    PASS();
-}
-
-/* ── Variable-width rank ─────────────────────────────────────── */
-
-static void test_hierarchy_rank_width(void)
-{
-    TEST(hierarchy_rank_width);
+    TEST(hierarchy_superpage);
     mt_hierarchy_t h;
-
-    /* Default: int16_t rank. */
-    mt_hierarchy_init_default(&h);
-    ASSERT(h.rank_wide == false, "default should use int16_t rank");
-    ASSERT(h.tree_cap == 512, "default tree_cap != 512");
-    ASSERT(h.leaf_cap == 511, "default leaf_cap != 511");
-
-    /* Superpage: int32_t rank. */
     mt_hierarchy_init_superpage(&h);
-    ASSERT(h.rank_wide == true, "superpage should use int32_t rank");
-    ASSERT(h.leaf_cap == (1 << 18) - 1, "superpage leaf_cap wrong");
-    ASSERT(h.tree_cap == (1 << 18), "superpage tree_cap wrong");
+    ASSERT(h.leaf_alloc == 2u * 1024 * 1024, "superpage leaf_alloc wrong");
+    ASSERT(h.cl_key_cap == MT_CL_KEY_CAP, "cl_key_cap wrong");
+    ASSERT(h.page_max_keys > 0, "page_max_keys is 0");
+    PASS();
+}
 
-    /* Custom small: int16_t rank. */
-    mt_level_t levels[2] = {
-        { .depth = 2, .hw_size = 16 },
-        { .depth = 4, .hw_size = 64 },
-    };
-    mt_hierarchy_init_custom(&h, levels, 2, MT_PAGE_SIZE);
-    ASSERT(h.rank_wide == false, "page-sized should use int16_t rank");
-    ASSERT(h.leaf_cap <= 32767, "page-sized leaf_cap exceeds int16_t range");
+/* ── Hierarchy: custom leaf allocation ───────────────────────── */
 
+static void test_hierarchy_custom(void)
+{
+    TEST(hierarchy_custom_leaf_alloc);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_custom(&h, 8192);
+    ASSERT(h.leaf_alloc == 8192, "custom leaf_alloc wrong");
+    ASSERT(h.cl_key_cap == MT_CL_KEY_CAP, "cl_key_cap wrong");
+    ASSERT(h.page_max_keys > 0, "page_max_keys is 0");
+    PASS();
+}
+
+/* ── Page sub-tree: CL capacity ───────────────────────────────── */
+
+static void test_page_subtree_capacity(void)
+{
+    TEST(page_subtree_capacity);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_default(&h);
+    ASSERT(h.cl_key_cap == 15, "cl_key_cap != 15");
+    ASSERT(h.cl_sep_cap == 12, "cl_sep_cap != 12");
+    ASSERT(h.cl_child_cap == 13, "cl_child_cap != 13");
+    ASSERT(h.page_slots == 63, "page_slots != 63");
+    ASSERT(h.min_cl_keys == 7, "min_cl_keys != 7");
+    ASSERT(h.min_cl_children == 7, "min_cl_children != 7");
     PASS();
 }
 
@@ -719,9 +673,9 @@ int main(void)
     test_delete_interleaved();
     test_create_with_default();
     test_bulk_load_with_default();
-    test_custom_hierarchy_simd_only();
-    test_custom_hierarchy_3level();
-    test_hierarchy_rank_width();
+    test_hierarchy_superpage();
+    test_hierarchy_custom();
+    test_page_subtree_capacity();
     test_arena_basic();
     test_arena_co_location();
 

@@ -34,7 +34,7 @@ mt_node_t *mt_alloc_lnode(const mt_hierarchy_t *hier, mt_allocator_t *alloc)
 
     if (!p) return NULL;
     memset(p, 0, alloc_size);
-    ((mt_lnode_t *)p)->type = MT_NODE_LEAF;
+    ((mt_lnode_t *)p)->header.type = MT_NODE_LEAF;
     return (mt_node_t *)p;
 }
 

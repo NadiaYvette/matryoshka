@@ -1,21 +1,19 @@
 /*
- * matryoshka.h — Matryoshka Tree: B+ tree with SIMD-blocked nodes
+ * matryoshka.h — Matryoshka Tree: B+ tree with nested sub-tree nodes
  *
- * A cache-conscious B+ tree where each node uses FAST-style hierarchical
- * blocking for intra-node search.  Internal nodes fit in a single 4 KiB
- * page with ~340 keys and 341 child pointers; leaf nodes use full FAST
- * blocked layout with ~1000 keys.  Modifications (insert/delete) are
- * O(B · log_B n) via node-local splits and merges.
+ * A cache-conscious B+ tree where each leaf node contains a B+ sub-tree
+ * of cache-line-sized sub-nodes.  This "matryoshka" nesting maps the
+ * data structure to the memory hierarchy:
  *
- * Memory hierarchy mapping:
- *   Level 0: SSE2 register (16 B)  — 3-key SIMD block, mask lookup
- *   Level 1: Cache line (64 B)     — 15-key FAST block
- *   Level 2: Page (4 KiB)          — B+ node, SIMD-accelerated search
- *   Level 3: Superpage (2 MiB)     — B+ upper levels
- *   Level 4: Main memory           — B+ root path, child pointers
+ *   Level 0: SSE2 register (16 B)  — SIMD search within sub-nodes
+ *   Level 1: Cache line (64 B)     — CL sub-node (15 keys or 12 seps)
+ *   Level 2: Page (4 KiB)          — B+ tree of CL sub-nodes
+ *   Level 3: Superpage (2 MiB)     — future: B+ tree of page sub-nodes
+ *   Level 4: Main memory           — outer B+ tree
  *
- * Levels 0–1: offset arithmetic (no pointers, pure FAST)
- * Levels 2–4: B+ tree pointers (node-local splits/merges)
+ * Operations within a leaf page modify only the affected CL sub-nodes,
+ * giving O(log b) insert/delete per node instead of O(B) flat-array
+ * rebuilds, where b is the CL branching factor.
  */
 
 #ifndef MATRYOSHKA_H
@@ -73,11 +71,12 @@ size_t matryoshka_size(const matryoshka_tree_t *tree);
 /* ── Modification ───────────────────────────────────────────── */
 
 /* Insert a key.  Returns true if the key was inserted, false if it
-   already existed.  O(B · log_B n). */
+   already existed.  O(log b · log_B n) where b is the CL branching
+   factor and B is the page-level key capacity. */
 bool matryoshka_insert(matryoshka_tree_t *tree, int32_t key);
 
 /* Delete a key.  Returns true if the key was found and removed, false
-   if it was not present.  O(B · log_B n). */
+   if it was not present.  O(log b · log_B n). */
 bool matryoshka_delete(matryoshka_tree_t *tree, int32_t key);
 
 /* ── Iteration ──────────────────────────────────────────────── */
