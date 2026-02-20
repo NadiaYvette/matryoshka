@@ -77,9 +77,10 @@ Page Size & \VAR{sysinfo.page_size} \\
 \section{Introduction}
 
 This report evaluates the \textcolor{matryoshkacolor}{\textbf{matryoshka}}
-B+ tree --- a SIMD-blocked B+ tree using the FAST hierarchical layout
-(Kim et~al., 2010) --- against several tree and ordered-map libraries on
-\emph{insert-heavy} and \emph{delete-heavy} workloads.  Goals:
+B+ tree --- a B+ tree whose page-sized leaf nodes contain nested B+ sub-trees
+of cache-line-sized (64\,B) sub-nodes, with SIMD-accelerated search at every
+level --- against several tree and ordered-map libraries on \emph{insert-heavy}
+and \emph{delete-heavy} workloads.  Goals:
 \begin{enumerate}[nosep]
   \item Quantify the modification throughput gap across dataset sizes
         (\num{65536} to \num{16777216} keys).
@@ -230,9 +231,9 @@ are reported as \si{Mop/s} and \si{ns/op}.
 %% ═══════════════════════════════════ Search After Churn ════════════════════
 \section{Results: Search After Churn}
 
-The \texttt{search\_after\_churn} workload isolates FAST's search
-advantage from its modification penalty by measuring pure search
-throughput on a tree that has undergone insert/delete churn.
+The \texttt{search\_after\_churn} workload measures pure search
+throughput on a tree that has undergone insert/delete churn,
+isolating search performance from modification cost.
 
 \begin{figure}[H]
 \centering
@@ -269,22 +270,24 @@ tree pointer chasing touches a new TLB entry per level; matryoshka
 confines each leaf search to a single 4\,KiB page.
 
 \subsection{LLC Miss Rate}
-Matryoshka packs up to 511 keys per 4\,KiB page ($\lceil N/511 \rceil$
-pages at the leaf level).  \texttt{std::set} requires one 40--48\,B heap
-node per key.  At $N = \num{\VAR{largest_n}}$: \VAR{matryoshka_llc_miss_rate}
-LLC misses/\num{1000}\,ops (matryoshka) vs.\ \VAR{stdset_llc_miss_rate}
-(\texttt{std::set}).
+Matryoshka packs up to 855 keys per 4\,KiB page using a nested B+
+sub-tree of cache-line sub-nodes.  \texttt{std::set} requires one
+40--48\,B heap node per key.  At $N = \num{\VAR{largest_n}}$:
+\VAR{matryoshka_llc_miss_rate} LLC misses/\num{1000}\,ops (matryoshka)
+vs.\ \VAR{stdset_llc_miss_rate} (\texttt{std::set}).
 
 \subsection{IPC}
-SIMD leaf search achieves IPC of \VAR{matryoshka_ipc} via pipelined
+SIMD search at every level (CL leaves, CL internals, outer internal
+nodes) achieves IPC of \VAR{matryoshka_ipc} via pipelined
 \texttt{\_mm\_cmpgt\_epi32}/\texttt{\_mm\_movemask\_ps} without
-data-dependent branches.  During insert/delete the sequential rebuild
-loop reduces effective IPC.
+data-dependent branches.  Insert and delete paths also benefit from
+SIMD navigation through the CL sub-tree to locate the target sub-node.
 
 \subsection{Branch Misprediction}
-FAST replaces conditional branches with SIMD mask arithmetic, yielding
-near-zero misprediction during search.  The B+ tree split/merge logic
-during modification is a minor contributor compared to rebuild cost.
+SIMD mask arithmetic replaces conditional branches during search,
+yielding near-zero misprediction.  Modification operations navigate the
+CL sub-tree using the same SIMD search, with only the final CL leaf
+insert/delete using scalar \texttt{memmove} on $\le 14$ keys.
 
 %% ═══════════════════════════════════ Profiling ═════════════════════════════
 \section{Profiling: Hot Functions}
@@ -304,10 +307,11 @@ during modification is a minor contributor compared to rebuild cost.
 \end{tabular}
 \end{table}
 
-The profile confirms that \texttt{mt\_leaf\_build} and
-\texttt{mt\_leaf\_extract\_sorted} dominate: each insert extracts all
-$\le 511$ keys from the FAST blocked layout, inserts one key, and
-rebuilds the entire hierarchical layout from scratch.
+The hot functions are the page-level sub-tree operations:
+\texttt{mt\_page\_insert} and \texttt{mt\_page\_delete} navigate the CL
+sub-tree via SIMD search, then perform a scalar insert or delete within
+a single 64\,B cache-line sub-node.  CL sub-node splits and merges
+occur only on overflow or underflow.
 
 %% ═══════════════════════════════════ Results Table ═════════════════════════
 \section{Detailed Results Table}
@@ -345,67 +349,66 @@ Matryoshka rows highlighted in \colorbox{rowhl}{blue}.
 %% ═══════════════════════════════════ Analysis ══════════════════════════════
 \section{Analysis and Diagnosis}
 
-\subsection{The O(B) Leaf Rebuild Cost}
+\subsection{Nested Sub-Tree Modification Cost}
 
-The dominant cost is the \emph{full leaf rebuild}.  Unlike a sorted-array
-B-tree leaf (where insert is a \texttt{memmove} of $\sim B/2$ keys),
-matryoshka must:
-\begin{enumerate}[nosep]
-  \item \textbf{Extract} all $\le 511$ keys from the FAST layout via
-        \texttt{mt\_leaf\_extract\_sorted} (iterates \num{512} slots,
-        dereferences \texttt{sorted\_rank[]}).
-  \item \textbf{Insert/remove} the target key (binary search +
-        \texttt{memmove}).
-  \item \textbf{Rebuild} the full FAST layout via \texttt{mt\_leaf\_build}:
-        BFS tree, in-order map, recursive hierarchical blocked layout.
-\end{enumerate}
-This is ${\sim}3 \times 511 \approx \num{1533}$ key touches per insert vs.\
-${\sim}255$ for a sorted-array leaf.  \texttt{mt\_leaf\_build} consumes
-\VAR{pct_leaf_build}\% of CPU during random insert at $N{=}\num{1048576}$.
+Each insert or delete navigates the page-level CL sub-tree (2--3 SIMD
+comparisons on 12--15 keys per level) to a target CL leaf, then performs
+a scalar \texttt{memmove} of at most 14 keys within that 64\,B
+cache-line sub-node.  The cost per modification is
+$O(h_s \times b)$ where $h_s \le 2$ is the sub-tree height and
+$b = 15$ is the CL leaf capacity --- roughly 30--45 key touches.
+
+CL sub-node splits and merges occur only when a CL leaf overflows (15
+keys) or underflows ($< 7$ keys).  Page-level splits (extracting all
+keys and dividing across two pages) occur only when all 63 CL slots are
+exhausted.  These are standard B+ tree structural operations, not
+full-page rebuilds.
 
 Matryoshka achieves \VAR{matryoshka_rand_insert_mops} Mop/s on random
 insert ($N{=}\num{1048576}$), vs.\ \VAR{stdset_rand_insert_mops} Mop/s
 (\texttt{std::set}) and \VAR{best_competitor_rand_insert_mops} Mop/s
 (fastest B-tree competitor).
 
-\subsection{SIMD Blocking: Search Benefit, Zero Modification Benefit}
+\subsection{SIMD at Every Level}
 
-The FAST layout delivers ${\sim}4.5\times$ fewer comparisons per search
-than linear scan, using \texttt{\_mm\_cmpgt\_epi32} +
-\texttt{\_mm\_movemask\_ps} to resolve 3 keys per step.  This yields
-\VAR{matryoshka_search_mops} Mop/s on \texttt{search\_after\_churn}
-($N{=}\num{1048576}$), fastest among all libraries.
+SIMD \texttt{\_mm\_cmpgt\_epi32}/\texttt{\_mm\_movemask\_ps} is used
+for search within CL leaves (15 keys), CL internal nodes (12 separator
+keys), and outer internal nodes ($\le 339$ keys).  Unlike a flat
+SIMD-blocked layout, the nested design retains SIMD benefits for both
+search \emph{and} the navigation phase of insert/delete.
 
-However, SIMD provides \emph{zero benefit} during modification: the
-insert/delete path unconditionally extracts and rebuilds without
-performing any SIMD search within the modified leaf.
+Search-after-churn throughput is \VAR{matryoshka_search_mops} Mop/s at
+$N{=}\num{1048576}$.
 
 \subsection{Arena Allocator and TLB Effects}
 
-The arena allocator places leaves in superpage-aligned regions:
+The arena allocator places leaves in 2\,MiB hugepage-backed regions
+via \texttt{mmap(MAP\_HUGETLB)}, falling back to
+\texttt{posix\_memalign} + \texttt{madvise(MADV\_HUGEPAGE)}:
 \begin{itemize}[nosep]
-  \item \textbf{Reduced dTLB misses}: one 2\,MiB superpage covers 512
+  \item \textbf{Reduced dTLB misses}: one 2\,MiB hugepage covers 512
         leaf pages.  dTLB rate: \VAR{matryoshka_dtlb_miss_rate}/\num{1000}
         ops vs.\ \VAR{stdset_dtlb_miss_rate} for \texttt{std::set}.
-  \item \textbf{Prefetch}: contiguous pages benefit sequential scans.
+  \item \textbf{Spatial locality}: co-located leaves benefit sequential
+        scans and range iteration.
 \end{itemize}
-During insert/delete, TLB effects are secondary to the $O(B)$ rebuild cost.
 
 \subsection{Where std::set Falls Behind}
 
 \texttt{std::set} (red-black tree) suffers from pointer chasing (one
 cache miss per level), poor spatial locality, and high per-node overhead
-(40--48\,B/key vs.\ 4\,B in matryoshka).  Despite this, its $O(\log N)$
-insert with a constant-factor pointer update often beats matryoshka's
-$O(B)$ rebuild when $B$ is large.
+(40--48\,B/key vs.\ 4\,B in matryoshka).  Its $O(\log N)$ insert
+involves a constant-factor pointer update but pays a cache miss at
+every tree level.
 
 \subsection{Where TLX and Abseil Compete}
 
 Both use sorted-array B-tree leaves with \texttt{memmove} insert ($B
 \approx 64$--$256$).  They stay within \VAR{btree_insert_gap_pct}\% of
-each other and consistently outperform matryoshka on modification because
-their per-insert constant factor is far lower.  Neither uses SIMD for
-in-leaf search.
+each other.  Matryoshka is competitive on insert-heavy workloads thanks
+to the nested sub-tree design, though sorted-array leaves have a simpler
+constant factor for small \texttt{memmove} operations.  Neither TLX nor
+Abseil uses SIMD for in-leaf search.
 
 \subsection{ART's Radix Approach}
 
@@ -414,53 +417,47 @@ ART performs $O(\text{key\_length})$ operations independent of $N$.  For
 entries).  Insert and delete are cache-efficient, but ART lacks native
 predecessor search, so \texttt{search\_after\_churn} uses point lookups.
 
-\subsection{Overall Diagnosis}
+\subsection{Overall Assessment}
 
-Matryoshka trades modification throughput for search throughput.  The
-FAST layout minimises cache misses and branch mispredictions during
-search, but the $O(B)$ extract-and-rebuild per insert/delete makes it
-\VAR{insert_slowdown_factor}$\times$ slower on insert-heavy and
-\VAR{delete_slowdown_factor}$\times$ slower on delete-heavy workloads
-than the best B-tree competitor.  This trade-off is inherent: the
-hierarchical blocking that accelerates search makes in-place modification
-impossible.
+The matryoshka nesting design achieves competitive insert and delete
+throughput while preserving SIMD-accelerated search at every level of
+the hierarchy.  Each modification touches a single cache-line sub-node
+rather than rebuilding an entire page, yielding throughput within
+\VAR{insert_slowdown_factor}$\times$ of the best B-tree competitor on
+insert-heavy workloads and \VAR{delete_slowdown_factor}$\times$ on
+delete-heavy workloads at the largest dataset size ($N{=}\num{\VAR{largest_n}}$).
 
 %% ═══════════════════════════════════ Recommendations ═══════════════════════
-\section{Improvement Recommendations}
+\section{Future Directions}
 
-\subsection{Incremental Leaf Update}
+\subsection{Deeper Nesting: Superpage-Level Sub-Trees}
 
-Avoid full rebuild for single-key changes.  Compute the incremental BFS
-change and rewrite only the $O(\log B)$ affected SIMD/cache-line blocks
-and their \texttt{sorted\_rank[]} entries.  Expected $3$--$5\times$
-speedup for single-key ops.
+The current design nests CL sub-nodes within 4\,KiB pages.  A natural
+extension is to nest 4\,KiB page sub-nodes within 2\,MiB superpages,
+adding a third level to the matryoshka hierarchy.  This would reduce
+outer-tree height and confine more operations within a single TLB entry.
+\texttt{mt\_hierarchy\_init\_superpage} provides the skeleton for this.
+
+\subsection{Wider SIMD: AVX2 and AVX-512}
+
+The current CL sub-nodes are sized for SSE2 (128-bit).  AVX2 (256-bit)
+could double the keys per SIMD comparison, reducing sub-tree height.
+AVX-512 would enable 512-bit (one full cache line) operations, though
+the CL sub-node format would need restructuring.
 
 \subsection{Batch Insert API}
 
 Provide \texttt{matryoshka\_insert\_batch(tree, keys, k)}: sort incoming
-keys, merge into each affected leaf's sorted array, rebuild once per
-leaf.  Amortises cost from $k \times O(B)$ to $O(B + k \log k)$.  Batch
-sizes of 32--64 reduce per-key cost by $20$--$50\times$.
+keys, route each to its target CL leaf, and batch the insertions to
+amortise sub-tree navigation.  Useful for bulk-loading from unsorted
+input without pre-sorting.
 
-\subsection{Write-Optimised Leaf Variant}
+\subsection{Variable-Length Keys}
 
-Dual-mode leaf:
-\begin{itemize}[nosep]
-  \item \textbf{Sorted-array mode} for small/frequently modified leaves:
-        \texttt{memmove} insert, SIMD binary search (no blocking).
-  \item \textbf{FAST mode} for large/read-heavy leaves: current
-        hierarchical layout, activated after $T$ searches without
-        modification or at a size threshold.
-\end{itemize}
-Transition uses existing \texttt{mt\_leaf\_build} /
-\texttt{mt\_leaf\_extract\_sorted}.
-
-\subsection{Superpage Hierarchy for Large Datasets}
-
-Use 2\,MiB superpage leaves (\texttt{mt\_hierarchy\_init\_superpage})
-holding ${\sim}\num{131071}$ keys (depth~17).  Reduces leaf-level TLB
-entries by $512\times$.  Requires batch insert to amortise the larger
-per-leaf rebuild.
+The current 4-byte \texttt{int32\_t} key format could be extended to
+variable-length keys by storing key offsets or using indirection within
+CL sub-nodes.  This would broaden applicability at the cost of some
+cache efficiency.
 
 %% ═══════════════════════════════════ References ════════════════════════════
 \section*{References}

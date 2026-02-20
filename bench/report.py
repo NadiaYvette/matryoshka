@@ -638,7 +638,7 @@ def make_hw_counter_chart(perf_data, libraries, chart_dir):
 # ── LaTeX Template Loading & Compilation ─────────────────────────
 
 LIBRARY_DESCRIPTIONS = {
-    "matryoshka":   "SIMD-blocked B+ tree (FAST layout), 511-key 4\\,KiB leaves, arena allocator",
+    "matryoshka":   "B+ tree with nested CL sub-tree leaves (up to 855 keys/page), SIMD search, hugepage arena",
     "std_set":      "Red-black tree (libstdc++), pointer-chasing, 40--48\\,B/node",
     "tlx_btree":    "Cache-conscious B+ tree, sorted-array leaves ($B{\\approx}128$)",
     "libart":       "Adaptive Radix Tree, 4-byte keys, no predecessor search",
