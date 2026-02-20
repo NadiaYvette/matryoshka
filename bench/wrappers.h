@@ -18,6 +18,7 @@
 /* ── matryoshka (C API) ─────────────────────────────────────── */
 
 #include "matryoshka.h"
+#include "matryoshka_internal.h"
 
 class WrapperMatryoshka {
     matryoshka_tree_t *tree_ = nullptr;
@@ -48,6 +49,90 @@ public:
     void clear() {
         if (tree_) matryoshka_destroy(tree_);
         tree_ = matryoshka_create();
+    }
+};
+
+/* ── matryoshka + fence keys ────────────────────────────────── */
+
+class WrapperMatryoshkaFence {
+    matryoshka_tree_t *tree_ = nullptr;
+public:
+    static const char *name() { return "matryoshka_fence"; }
+    static const char *label() { return "Matryoshka + fence keys"; }
+
+    WrapperMatryoshkaFence() {
+        mt_hierarchy_t h;
+        mt_hierarchy_init_fence(&h);
+        tree_ = matryoshka_create_with(&h);
+    }
+    ~WrapperMatryoshkaFence() { if (tree_) matryoshka_destroy(tree_); }
+
+    WrapperMatryoshkaFence(const WrapperMatryoshkaFence &) = delete;
+    WrapperMatryoshkaFence &operator=(const WrapperMatryoshkaFence &) = delete;
+
+    bool insert(int32_t key) { return matryoshka_insert(tree_, key); }
+    bool remove(int32_t key) { return matryoshka_delete(tree_, key); }
+    bool search(int32_t key) const {
+        int32_t r;
+        return matryoshka_search(tree_, key, &r);
+    }
+    bool contains(int32_t key) const {
+        return matryoshka_contains(tree_, key);
+    }
+    void bulk_load(const int32_t *keys, size_t n) {
+        if (tree_) matryoshka_destroy(tree_);
+        mt_hierarchy_t h;
+        mt_hierarchy_init_fence(&h);
+        tree_ = matryoshka_bulk_load_with(keys, n, &h);
+    }
+    size_t size() const { return matryoshka_size(tree_); }
+    void clear() {
+        if (tree_) matryoshka_destroy(tree_);
+        mt_hierarchy_t h;
+        mt_hierarchy_init_fence(&h);
+        tree_ = matryoshka_create_with(&h);
+    }
+};
+
+/* ── matryoshka + Eytzinger layout ─────────────────────────── */
+
+class WrapperMatryoshkaEytzinger {
+    matryoshka_tree_t *tree_ = nullptr;
+public:
+    static const char *name() { return "matryoshka_eytz"; }
+    static const char *label() { return "Matryoshka + Eytzinger"; }
+
+    WrapperMatryoshkaEytzinger() {
+        mt_hierarchy_t h;
+        mt_hierarchy_init_eytzinger(&h);
+        tree_ = matryoshka_create_with(&h);
+    }
+    ~WrapperMatryoshkaEytzinger() { if (tree_) matryoshka_destroy(tree_); }
+
+    WrapperMatryoshkaEytzinger(const WrapperMatryoshkaEytzinger &) = delete;
+    WrapperMatryoshkaEytzinger &operator=(const WrapperMatryoshkaEytzinger &) = delete;
+
+    bool insert(int32_t key) { return matryoshka_insert(tree_, key); }
+    bool remove(int32_t key) { return matryoshka_delete(tree_, key); }
+    bool search(int32_t key) const {
+        int32_t r;
+        return matryoshka_search(tree_, key, &r);
+    }
+    bool contains(int32_t key) const {
+        return matryoshka_contains(tree_, key);
+    }
+    void bulk_load(const int32_t *keys, size_t n) {
+        if (tree_) matryoshka_destroy(tree_);
+        mt_hierarchy_t h;
+        mt_hierarchy_init_eytzinger(&h);
+        tree_ = matryoshka_bulk_load_with(keys, n, &h);
+    }
+    size_t size() const { return matryoshka_size(tree_); }
+    void clear() {
+        if (tree_) matryoshka_destroy(tree_);
+        mt_hierarchy_t h;
+        mt_hierarchy_init_eytzinger(&h);
+        tree_ = matryoshka_create_with(&h);
     }
 };
 

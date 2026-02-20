@@ -236,14 +236,13 @@ bool mt_sp_contains(const void *sp, int32_t key)
 
 mt_status_t mt_sp_insert(void *sp, int32_t key, const mt_hierarchy_t *hier)
 {
-    (void)hier;
     mt_sp_header_t *hdr = sp_hdr(sp);
     mt_sp_path_t path[MT_SP_MAX_HEIGHT];
     int path_len;
     int leaf_idx = sp_find_leaf(sp, key, path, &path_len);
     mt_lnode_t *page = (mt_lnode_t *)sp_page(sp, leaf_idx);
 
-    mt_status_t status = mt_page_insert(page, key);
+    mt_status_t status = mt_page_insert(page, key, hier);
 
     if (status == MT_DUPLICATE) return MT_DUPLICATE;
     if (status == MT_OK) {
@@ -262,12 +261,12 @@ mt_status_t mt_sp_insert(void *sp, int32_t key, const mt_hierarchy_t *hier)
     mt_lnode_t *saved_prev = page->header.prev;
     mt_lnode_t *saved_next = page->header.next;
 
-    int32_t sep = mt_page_split(page, new_page);
+    int32_t sep = mt_page_split(page, new_page, hier);
 
     if (key < sep)
-        mt_page_insert(page, key);
+        mt_page_insert(page, key, hier);
     else
-        mt_page_insert(new_page, key);
+        mt_page_insert(new_page, key, hier);
     hdr->nkeys++;
 
     /* Restore linked list: splice new_page after page. */
@@ -417,8 +416,8 @@ mt_status_t mt_sp_delete(void *sp, int32_t key, const mt_hierarchy_t *hier)
                 mt_lnode_t *rp = page->header.prev;
                 mt_lnode_t *rn_next = page->header.next;
 
-                mt_page_bulk_load(left, lkeys, new_ln);
-                mt_page_bulk_load(page, new_right, move + rn);
+                mt_page_bulk_load(left, lkeys, new_ln, hier);
+                mt_page_bulk_load(page, new_right, move + rn, hier);
 
                 left->header.prev = lp;
                 left->header.next = ln_next;
@@ -456,8 +455,8 @@ mt_status_t mt_sp_delete(void *sp, int32_t key, const mt_hierarchy_t *hier)
                 mt_lnode_t *rp = right->header.prev;
                 mt_lnode_t *rn_next = right->header.next;
 
-                mt_page_bulk_load(page, new_left, new_ln);
-                mt_page_bulk_load(right, new_right_keys, new_rn);
+                mt_page_bulk_load(page, new_left, new_ln, hier);
+                mt_page_bulk_load(right, new_right_keys, new_rn, hier);
 
                 page->header.prev = lp;
                 page->header.next = ln_next;
@@ -485,7 +484,7 @@ mt_status_t mt_sp_delete(void *sp, int32_t key, const mt_hierarchy_t *hier)
 
             mt_lnode_t *lp = left->header.prev;
 
-            mt_page_bulk_load(left, merged, ln + rn);
+            mt_page_bulk_load(left, merged, ln + rn, hier);
 
             left->header.prev = lp;
             left->header.next = page->header.next;
@@ -509,7 +508,7 @@ mt_status_t mt_sp_delete(void *sp, int32_t key, const mt_hierarchy_t *hier)
 
             mt_lnode_t *lp = page->header.prev;
 
-            mt_page_bulk_load(page, merged, ln + rn);
+            mt_page_bulk_load(page, merged, ln + rn, hier);
 
             page->header.prev = lp;
             page->header.next = right->header.next;
@@ -577,7 +576,7 @@ void mt_sp_bulk_load(void *sp, const int32_t *keys, int nkeys,
     if (nkeys == 0) {
         int root = sp_page_alloc(hdr);
         mt_lnode_t *page = (mt_lnode_t *)sp_page(sp, root);
-        mt_page_init(page);
+        mt_page_init_with(page, hier);
         hdr->root_page = (uint16_t)root;
         hdr->sub_height = 0;
         hdr->nkeys = 0;
@@ -601,7 +600,7 @@ void mt_sp_bulk_load(void *sp, const int32_t *keys, int nkeys,
         int k = keys_per + (i < extra ? 1 : 0);
         int pidx = sp_page_alloc(hdr);
         mt_lnode_t *page = (mt_lnode_t *)sp_page(sp, pidx);
-        mt_page_bulk_load(page, keys + offset, k);
+        mt_page_bulk_load(page, keys + offset, k, hier);
         leaf_pages[i] = (uint16_t)pidx;
         seps[i] = keys[offset];
         offset += k;

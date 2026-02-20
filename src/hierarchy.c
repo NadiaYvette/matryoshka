@@ -59,6 +59,25 @@ void mt_hierarchy_init_default(mt_hierarchy_t *h)
     h->use_superpages  = false;
     h->sp_max_keys     = 0;
     h->min_sp_keys     = 0;
+    h->cl_strategy     = MT_CL_STRAT_DEFAULT;
+}
+
+void mt_hierarchy_init_fence(mt_hierarchy_t *h)
+{
+    mt_hierarchy_init_default(h);
+    h->cl_strategy = MT_CL_STRAT_FENCE;
+}
+
+void mt_hierarchy_init_eytzinger(mt_hierarchy_t *h)
+{
+    mt_hierarchy_init_default(h);
+    h->cl_strategy     = MT_CL_STRAT_EYTZ;
+    h->cl_sep_cap      = MT_CL_EYTZ_SEP_CAP;
+    h->cl_child_cap    = MT_CL_EYTZ_CHILD_CAP;
+    /* Height ≤ 1: 1 root internal + up to 16 CL leaves = 17 slots.
+       Max keys = 16 × 15 = 240. */
+    h->page_max_keys   = MT_CL_EYTZ_CHILD_CAP * MT_CL_KEY_CAP;  /* 240 */
+    h->min_page_keys   = h->page_max_keys / 4;                    /* 60 */
 }
 
 void mt_hierarchy_init_superpage(mt_hierarchy_t *h)

@@ -877,6 +877,242 @@ static void test_sp_predecessor_search(void)
     PASS();
 }
 
+/* ── Fence key tests ──────────────────────────────────────────── */
+
+static void test_fence_insert_search(void)
+{
+    TEST(fence_insert_search_200);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_fence(&h);
+    matryoshka_tree_t *t = matryoshka_create_with(&h);
+    ASSERT(t != NULL, "create failed");
+
+    for (int i = 0; i < 200; i++)
+        ASSERT(matryoshka_insert(t, i * 3), "insert failed");
+    ASSERT(matryoshka_size(t) == 200, "wrong size");
+
+    for (int i = 0; i < 200; i++)
+        ASSERT(matryoshka_contains(t, i * 3), "key not found");
+    ASSERT(!matryoshka_contains(t, 1), "phantom key");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_fence_bulk_load(void)
+{
+    TEST(fence_bulk_load_10000);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_fence(&h);
+    int n = 10000;
+    int32_t *keys = malloc((size_t)n * sizeof(int32_t));
+    for (int i = 0; i < n; i++) keys[i] = i;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, (size_t)n, &h);
+    ASSERT(t != NULL, "bulk_load failed");
+    ASSERT(matryoshka_size(t) == (size_t)n, "wrong size");
+    for (int i = 0; i < n; i += 97)
+        ASSERT(matryoshka_contains(t, i), "key not found");
+    matryoshka_destroy(t);
+    free(keys);
+    PASS();
+}
+
+static void test_fence_delete(void)
+{
+    TEST(fence_delete_half);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_fence(&h);
+    matryoshka_tree_t *t = matryoshka_create_with(&h);
+    for (int i = 0; i < 500; i++)
+        matryoshka_insert(t, i);
+
+    for (int i = 0; i < 500; i += 2)
+        ASSERT(matryoshka_delete(t, i), "delete failed");
+    ASSERT(matryoshka_size(t) == 250, "wrong size");
+
+    for (int i = 1; i < 500; i += 2)
+        ASSERT(matryoshka_contains(t, i), "odd key missing");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_fence_predecessor(void)
+{
+    TEST(fence_predecessor_search);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_fence(&h);
+    int32_t keys[100];
+    for (int i = 0; i < 100; i++) keys[i] = i * 10;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, 100, &h);
+
+    int32_t result;
+    ASSERT(matryoshka_search(t, 55, &result) && result == 50,
+           "pred(55) != 50");
+    ASSERT(matryoshka_search(t, 990, &result) && result == 990,
+           "exact 990 failed");
+    ASSERT(!matryoshka_search(t, -1, &result),
+           "no pred below min");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_fence_iterator(void)
+{
+    TEST(fence_iterator_2000);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_fence(&h);
+    int n = 2000;
+    int32_t *keys = malloc((size_t)n * sizeof(int32_t));
+    for (int i = 0; i < n; i++) keys[i] = i;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, (size_t)n, &h);
+
+    matryoshka_iter_t *it = matryoshka_iter_from(t, INT32_MIN);
+    int count = 0;
+    int32_t key, prev = INT32_MIN;
+    while (matryoshka_iter_next(it, &key)) {
+        if (count > 0) ASSERT(key > prev, "not increasing");
+        prev = key; count++;
+    }
+    ASSERT(count == n, "wrong count");
+    matryoshka_iter_destroy(it);
+    matryoshka_destroy(t);
+    free(keys);
+    PASS();
+}
+
+/* ── Eytzinger tests ─────────────────────────────────────────── */
+
+static void test_eytz_insert_search(void)
+{
+    TEST(eytz_insert_search_300);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_eytzinger(&h);
+    matryoshka_tree_t *t = matryoshka_create_with(&h);
+    ASSERT(t != NULL, "create failed");
+
+    /* 300 keys forces page splits at 240 keys. */
+    for (int i = 0; i < 300; i++)
+        ASSERT(matryoshka_insert(t, i * 3), "insert failed");
+    ASSERT(matryoshka_size(t) == 300, "wrong size");
+
+    for (int i = 0; i < 300; i++)
+        ASSERT(matryoshka_contains(t, i * 3), "key not found");
+    ASSERT(!matryoshka_contains(t, 1), "phantom key");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_eytz_bulk_load(void)
+{
+    TEST(eytz_bulk_load_5000);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_eytzinger(&h);
+    int n = 5000;
+    int32_t *keys = malloc((size_t)n * sizeof(int32_t));
+    for (int i = 0; i < n; i++) keys[i] = i;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, (size_t)n, &h);
+    ASSERT(t != NULL, "bulk_load failed");
+    ASSERT(matryoshka_size(t) == (size_t)n, "wrong size");
+    for (int i = 0; i < n; i += 97)
+        ASSERT(matryoshka_contains(t, i), "key not found");
+    matryoshka_destroy(t);
+    free(keys);
+    PASS();
+}
+
+static void test_eytz_delete(void)
+{
+    TEST(eytz_delete_half);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_eytzinger(&h);
+    matryoshka_tree_t *t = matryoshka_create_with(&h);
+    for (int i = 0; i < 500; i++)
+        matryoshka_insert(t, i);
+
+    for (int i = 0; i < 500; i += 2)
+        ASSERT(matryoshka_delete(t, i), "delete failed");
+    ASSERT(matryoshka_size(t) == 250, "wrong size");
+
+    for (int i = 1; i < 500; i += 2)
+        ASSERT(matryoshka_contains(t, i), "odd key missing");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_eytz_predecessor(void)
+{
+    TEST(eytz_predecessor_search);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_eytzinger(&h);
+    int32_t keys[100];
+    for (int i = 0; i < 100; i++) keys[i] = i * 10;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, 100, &h);
+
+    int32_t result;
+    ASSERT(matryoshka_search(t, 55, &result) && result == 50,
+           "pred(55) != 50");
+    ASSERT(matryoshka_search(t, 990, &result) && result == 990,
+           "exact 990 failed");
+    ASSERT(!matryoshka_search(t, -1, &result),
+           "no pred below min");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_eytz_iterator(void)
+{
+    TEST(eytz_iterator_2000);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_eytzinger(&h);
+    int n = 2000;
+    int32_t *keys = malloc((size_t)n * sizeof(int32_t));
+    for (int i = 0; i < n; i++) keys[i] = i;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, (size_t)n, &h);
+
+    matryoshka_iter_t *it = matryoshka_iter_from(t, INT32_MIN);
+    int count = 0;
+    int32_t key, prev = INT32_MIN;
+    while (matryoshka_iter_next(it, &key)) {
+        if (count > 0) ASSERT(key > prev, "not increasing");
+        prev = key; count++;
+    }
+    ASSERT(count == n, "wrong count");
+    matryoshka_iter_destroy(it);
+    matryoshka_destroy(t);
+    free(keys);
+    PASS();
+}
+
+static void test_eytz_large_insert_delete(void)
+{
+    TEST(eytz_insert_delete_5000);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_eytzinger(&h);
+    matryoshka_tree_t *t = matryoshka_create_with(&h);
+
+    /* Insert 5000 ascending. */
+    for (int i = 0; i < 5000; i++)
+        ASSERT(matryoshka_insert(t, i), "insert failed");
+    ASSERT(matryoshka_size(t) == 5000, "wrong size after insert");
+
+    /* Delete first 2500. */
+    for (int i = 0; i < 2500; i++)
+        ASSERT(matryoshka_delete(t, i), "delete failed");
+    ASSERT(matryoshka_size(t) == 2500, "wrong size after delete");
+
+    /* Verify remaining. */
+    for (int i = 2500; i < 5000; i++)
+        ASSERT(matryoshka_contains(t, i), "remaining key missing");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
 /* ── Main ─────────────────────────────────────────────────────── */
 
 int main(void)
@@ -925,6 +1161,17 @@ int main(void)
     test_sp_delete();
     test_sp_iterator();
     test_sp_predecessor_search();
+    test_fence_insert_search();
+    test_fence_bulk_load();
+    test_fence_delete();
+    test_fence_predecessor();
+    test_fence_iterator();
+    test_eytz_insert_search();
+    test_eytz_bulk_load();
+    test_eytz_delete();
+    test_eytz_predecessor();
+    test_eytz_iterator();
+    test_eytz_large_insert_delete();
 
     printf("\n  %d/%d tests passed.\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

@@ -135,7 +135,7 @@ matryoshka_tree_t *matryoshka_create_with(const mt_hierarchy_t *hier)
     if (hier->use_superpages)
         mt_sp_init(tree->root);
     else
-        mt_page_init(&tree->root->lnode);
+        mt_page_init_with(&tree->root->lnode, hier);
     return tree;
 }
 
@@ -201,7 +201,7 @@ matryoshka_tree_t *matryoshka_bulk_load_with(const int32_t *sorted_keys,
         if (hier->use_superpages)
             mt_sp_init(tree->root);
         else
-            mt_page_init(&tree->root->lnode);
+            mt_page_init_with(&tree->root->lnode, hier);
         tree->height = 0;
         return tree;
     }
@@ -221,7 +221,7 @@ matryoshka_tree_t *matryoshka_bulk_load_with(const int32_t *sorted_keys,
         if (hier->use_superpages)
             mt_sp_bulk_load(lnode, sorted_keys + offset, (int)k, hier);
         else
-            mt_page_bulk_load(&lnode->lnode, sorted_keys + offset, (int)k);
+            mt_page_bulk_load(&lnode->lnode, sorted_keys + offset, (int)k, hier);
         entries[i].node = lnode;
         entries[i].min_key = sorted_keys[offset];
         offset += k;
@@ -529,12 +529,12 @@ static void split_leaf_and_insert(matryoshka_tree_t *tree, mt_path_t *path,
     mt_node_t *new_rnode = mt_alloc_lnode(&tree->hier, tree->alloc);
     mt_lnode_t *new_right = &new_rnode->lnode;
 
-    int32_t sep = mt_page_split(leaf, new_right);
+    int32_t sep = mt_page_split(leaf, new_right, &tree->hier);
 
     if (key < sep)
-        mt_page_insert(leaf, key);
+        mt_page_insert(leaf, key, &tree->hier);
     else
-        mt_page_insert(new_right, key);
+        mt_page_insert(new_right, key, &tree->hier);
 
     /* Restore linked list and splice in new_right after leaf. */
     leaf->header.prev = saved_prev;
@@ -580,7 +580,7 @@ bool matryoshka_insert(matryoshka_tree_t *tree, int32_t key)
 
     mt_lnode_t *leaf = find_leaf(tree->root, tree->height, key, path);
 
-    mt_status_t status = mt_page_insert(leaf, key);
+    mt_status_t status = mt_page_insert(leaf, key, &tree->hier);
 
     if (status == MT_DUPLICATE)
         return false;
@@ -631,8 +631,8 @@ static void rebalance_leaf(matryoshka_tree_t *tree, mt_path_t *path,
             struct mt_lnode *rp = leaf->header.prev;
             struct mt_lnode *rn_next = leaf->header.next;
 
-            mt_page_bulk_load(left, lsorted, new_ln);
-            mt_page_bulk_load(leaf, new_right, new_rn);
+            mt_page_bulk_load(left, lsorted, new_ln, &tree->hier);
+            mt_page_bulk_load(leaf, new_right, new_rn, &tree->hier);
 
             left->header.prev = lp;
             left->header.next = ln_next;
@@ -670,8 +670,8 @@ static void rebalance_leaf(matryoshka_tree_t *tree, mt_path_t *path,
             struct mt_lnode *rp = right->header.prev;
             struct mt_lnode *rn_next = right->header.next;
 
-            mt_page_bulk_load(leaf, new_left, new_ln);
-            mt_page_bulk_load(right, new_right_keys, new_rn);
+            mt_page_bulk_load(leaf, new_left, new_ln, &tree->hier);
+            mt_page_bulk_load(right, new_right_keys, new_rn, &tree->hier);
 
             leaf->header.prev = lp;
             leaf->header.next = ln_next;
@@ -696,7 +696,7 @@ static void rebalance_leaf(matryoshka_tree_t *tree, mt_path_t *path,
 
         struct mt_lnode *lp = left->header.prev;
 
-        mt_page_bulk_load(left, merged, ln + rn);
+        mt_page_bulk_load(left, merged, ln + rn, &tree->hier);
 
         /* Restore and update linked list. */
         left->header.prev = lp;
@@ -719,7 +719,7 @@ static void rebalance_leaf(matryoshka_tree_t *tree, mt_path_t *path,
 
         struct mt_lnode *lp = leaf->header.prev;
 
-        mt_page_bulk_load(leaf, merged, ln + rn);
+        mt_page_bulk_load(leaf, merged, ln + rn, &tree->hier);
 
         /* Restore and update linked list. */
         leaf->header.prev = lp;
@@ -1242,7 +1242,7 @@ size_t matryoshka_insert_batch(matryoshka_tree_t *tree,
             if (sp)
                 status = mt_sp_insert(leaf_node, sorted[i], &tree->hier);
             else
-                status = mt_page_insert(&leaf_node->lnode, sorted[i]);
+                status = mt_page_insert(&leaf_node->lnode, sorted[i], &tree->hier);
 
             if (status == MT_DUPLICATE) { i++; continue; }
 

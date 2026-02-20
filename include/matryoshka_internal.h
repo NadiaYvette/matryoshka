@@ -31,6 +31,17 @@
 #include "matryoshka.h"
 #include <immintrin.h>
 
+/* C/C++ compatibility for static assertions. */
+#ifdef __cplusplus
+#define MT_STATIC_ASSERT(cond, msg) static_assert(cond, msg)
+#else
+#define MT_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ── Compile-time constants ─────────────────────────────────── */
 
 #define MT_PAGE_SIZE       4096
@@ -50,6 +61,14 @@
 #define MT_CL_CHILD_CAP    13
 #define MT_CL_MIN_CHILDREN 7       /* ceil(13/2) */
 
+/* Eytzinger CL internal: 4 B header + 15 × 4 B keys = 64 B (no children[]) */
+#define MT_CL_EYTZ_SEP_CAP    15
+#define MT_CL_EYTZ_CHILD_CAP  16
+
+/* Fence keys embedded in page header (6 keys in 32 spare bytes). */
+#define MT_FENCE_KEY_CAP   6
+#define MT_FENCE_SLOT_CAP  7       /* MT_FENCE_KEY_CAP + 1 */
+
 /* Page: 64 CL slots.  Slot 0 = header; slots 1–63 usable. */
 #define MT_PAGE_SLOTS      63
 
@@ -59,6 +78,14 @@
 #define MT_INODE_HEADER    16
 #define MT_MAX_IKEYS       339
 #define MT_MIN_IKEYS       ((MT_MAX_IKEYS) / 2)
+
+/* ── CL sub-tree strategy ──────────────────────────────────── */
+
+typedef enum {
+    MT_CL_STRAT_DEFAULT = 0,   /* Slot-indexed CL sub-tree (baseline) */
+    MT_CL_STRAT_FENCE   = 1,   /* + fence keys in page header */
+    MT_CL_STRAT_EYTZ    = 2,   /* Eytzinger dense BFS layout, height ≤ 1 */
+} mt_cl_strategy_t;
 
 /* ── Hierarchy configuration ───────────────────────────────── */
 
@@ -75,6 +102,7 @@ typedef struct mt_hierarchy {
     bool    use_superpages;   /* Whether leaves are 2 MiB superpages */
     int     sp_max_keys;      /* Max keys per superpage (~436K) */
     int     min_sp_keys;      /* Min superpage occupancy for outer tree */
+    int     cl_strategy;      /* mt_cl_strategy_t: DEFAULT, FENCE, or EYTZ */
 } mt_hierarchy_t;
 
 /* ── Arena allocator types ──────────────────────────────────── */
@@ -122,7 +150,7 @@ typedef struct mt_cl_leaf {
     int32_t  keys[MT_CL_KEY_CAP]; /* Sorted keys */
 } mt_cl_leaf_t;
 
-_Static_assert(sizeof(mt_cl_leaf_t) == MT_CL_SIZE,
+MT_STATIC_ASSERT(sizeof(mt_cl_leaf_t) == MT_CL_SIZE,
                "mt_cl_leaf_t must be exactly 64 bytes");
 
 /* Cache-line internal: separator keys + child slot indices. */
@@ -134,18 +162,33 @@ typedef struct mt_cl_inode {
     int32_t  keys[MT_CL_SEP_CAP];     /* Separator keys */
 } mt_cl_inode_t;
 
-_Static_assert(sizeof(mt_cl_inode_t) == MT_CL_SIZE,
+MT_STATIC_ASSERT(sizeof(mt_cl_inode_t) == MT_CL_SIZE,
                "mt_cl_inode_t must be exactly 64 bytes");
+
+/* Eytzinger CL internal: no children[] array, 15 separator keys.
+   Children are at implicit BFS positions: root at slot R, children
+   at slots R+1 .. R+nchildren.  */
+typedef struct mt_cl_inode_eytz {
+    uint8_t  type;                             /* MT_CL_INTERNAL */
+    uint8_t  nkeys;                            /* 0–15 separator keys */
+    uint8_t  nchildren;                        /* 1–16 children */
+    uint8_t  _pad;
+    int32_t  keys[MT_CL_EYTZ_SEP_CAP];        /* 15 × 4 B = 60 B */
+} mt_cl_inode_eytz_t;
+
+MT_STATIC_ASSERT(sizeof(mt_cl_inode_eytz_t) == MT_CL_SIZE,
+               "mt_cl_inode_eytz_t must be exactly 64 bytes");
 
 /* Generic CL slot — tagged union at offset 0. */
 typedef union mt_cl_slot {
-    uint8_t        type;       /* Discriminant: MT_CL_FREE/LEAF/INTERNAL */
-    mt_cl_leaf_t   leaf;
-    mt_cl_inode_t  inode;
-    uint8_t        raw[MT_CL_SIZE];
+    uint8_t              type;       /* Discriminant: MT_CL_FREE/LEAF/INTERNAL */
+    mt_cl_leaf_t         leaf;
+    mt_cl_inode_t        inode;
+    mt_cl_inode_eytz_t   inode_eytz;
+    uint8_t              raw[MT_CL_SIZE];
 } mt_cl_slot_t;
 
-_Static_assert(sizeof(mt_cl_slot_t) == MT_CL_SIZE,
+MT_STATIC_ASSERT(sizeof(mt_cl_slot_t) == MT_CL_SIZE,
                "mt_cl_slot_t must be exactly 64 bytes");
 
 /* ── Superpage constants ────────────────────────────────────── */
@@ -177,7 +220,7 @@ typedef struct mt_sp_header {
     uint8_t   _reserved[4000]; /* pad to 4096 */
 } mt_sp_header_t;
 
-_Static_assert(sizeof(mt_sp_header_t) == MT_PAGE_SIZE,
+MT_STATIC_ASSERT(sizeof(mt_sp_header_t) == MT_PAGE_SIZE,
                "mt_sp_header_t must be exactly 4096 bytes");
 
 /* ── Page-level internal node within superpage ─────────────── */
@@ -190,7 +233,7 @@ typedef struct mt_sp_inode {
     uint16_t  children[MT_SP_MAX_IKEYS+1]; /* page indices (0–511) */
 } mt_sp_inode_t;
 
-_Static_assert(sizeof(mt_sp_inode_t) == MT_PAGE_SIZE,
+MT_STATIC_ASSERT(sizeof(mt_sp_inode_t) == MT_PAGE_SIZE,
                "mt_sp_inode_t must be exactly 4096 bytes");
 
 /* ── Page header (slot 0 of a leaf page) ────────────────────── */
@@ -201,14 +244,19 @@ typedef struct mt_page_header {
     uint8_t          root_slot;     /* CL slot index of sub-tree root (1–63) */
     uint8_t          sub_height;    /* Sub-tree height (0 = single CL leaf) */
     uint8_t          nslots_used;   /* Number of CL slots allocated */
-    uint8_t          _pad;
+    uint8_t          flags;         /* Bit 0: Eytzinger layout */
     uint64_t         slot_bitmap;   /* Bits 1–63: CL slot allocation */
     struct mt_lnode *prev;          /* Previous leaf (outer tree linked list) */
     struct mt_lnode *next;          /* Next leaf (outer tree linked list) */
-    uint8_t          _reserved[32]; /* Pad to 64 B */
+    /* Fence keys: CL root internal separators cached in the header.
+       Valid when nfence > 0 && nfence == root internal's nkeys.
+       fence_slots[i] = CL slot for the i-th child (0 ≤ i ≤ nfence). */
+    int32_t          fence_keys[MT_FENCE_KEY_CAP];   /* +32, 24 B */
+    uint8_t          fence_slots[MT_FENCE_SLOT_CAP]; /* +56,  7 B */
+    uint8_t          nfence;                         /* +63,  1 B */
 } mt_page_header_t;
 
-_Static_assert(sizeof(mt_page_header_t) == MT_CL_SIZE,
+MT_STATIC_ASSERT(sizeof(mt_page_header_t) == MT_CL_SIZE,
                "mt_page_header_t must be exactly 64 bytes");
 
 /* ── Leaf node (4 KiB page with matryoshka-nested sub-tree) ── */
@@ -221,7 +269,7 @@ typedef struct mt_lnode {
     mt_cl_slot_t      slots[MT_PAGE_SLOTS]; /* Slots 1–63: CL sub-nodes */
 } mt_lnode_t;
 
-_Static_assert(sizeof(mt_lnode_t) == MT_PAGE_SIZE,
+MT_STATIC_ASSERT(sizeof(mt_lnode_t) == MT_PAGE_SIZE,
                "mt_lnode_t must be exactly 4096 bytes");
 
 /* ── Outer B+ tree nodes ────────────────────────────────────── */
@@ -319,8 +367,13 @@ struct matryoshka_iter {
 /* ── Hierarchy factory functions ───────────────────────────── */
 
 void mt_hierarchy_init_default(mt_hierarchy_t *h);
+void mt_hierarchy_init_fence(mt_hierarchy_t *h);
+void mt_hierarchy_init_eytzinger(mt_hierarchy_t *h);
 void mt_hierarchy_init_superpage(mt_hierarchy_t *h);
 void mt_hierarchy_init_custom(mt_hierarchy_t *h, size_t leaf_alloc);
+
+/* Page header flags (mt_page_header_t.flags). */
+#define MT_PAGE_FLAG_EYTZ  0x01   /* Eytzinger dense BFS layout */
 
 /* ── Page sub-tree operations (leaf.c) ─────────────────────── */
 
@@ -346,7 +399,8 @@ bool mt_page_search_key(const mt_lnode_t *page, int32_t key, int32_t *result);
 
 /* Insert a key into a leaf page.
    Returns MT_OK, MT_DUPLICATE, or MT_PAGE_FULL. */
-mt_status_t mt_page_insert(mt_lnode_t *page, int32_t key);
+mt_status_t mt_page_insert(mt_lnode_t *page, int32_t key,
+                            const mt_hierarchy_t *hier);
 
 /* Delete a key from a leaf page.
    Returns MT_OK, MT_NOT_FOUND, or MT_UNDERFLOW. */
@@ -358,17 +412,23 @@ mt_status_t mt_page_delete(mt_lnode_t *page, int32_t key,
    Returns the number of keys extracted. */
 int mt_page_extract_sorted(const mt_lnode_t *page, int32_t *out);
 
-/* Bulk-load sorted keys into an empty page.  O(n). */
-void mt_page_bulk_load(mt_lnode_t *page, const int32_t *sorted_keys, int nkeys);
+/* Bulk-load sorted keys into an empty page.  O(n).
+   Uses hier->cl_strategy to select sub-tree layout. */
+void mt_page_bulk_load(mt_lnode_t *page, const int32_t *sorted_keys, int nkeys,
+                        const mt_hierarchy_t *hier);
+
+/* Initialise an empty leaf page using the given hierarchy. */
+void mt_page_init_with(mt_lnode_t *page, const mt_hierarchy_t *hier);
 
 /* Split a page: move approximately half of the keys to `new_page`.
    Returns the separator key (first key of new_page). */
-int32_t mt_page_split(mt_lnode_t *page, mt_lnode_t *new_page);
+int32_t mt_page_split(mt_lnode_t *page, mt_lnode_t *new_page,
+                       const mt_hierarchy_t *hier);
 
 /* Return the minimum (first) key in a page. */
 int32_t mt_page_min_key(const mt_lnode_t *page);
 
-/* Check if a key exists in the page. */
+/* Membership test within a leaf page. */
 bool mt_page_contains(const mt_lnode_t *page, int32_t key);
 
 /* ── Internal node search (inode.c) ───────────────────────── */
@@ -408,5 +468,9 @@ mt_allocator_t *mt_allocator_create(size_t arena_size, size_t page_size);
 void            mt_allocator_destroy(mt_allocator_t *alloc);
 void           *mt_allocator_alloc(mt_allocator_t *alloc);
 void            mt_allocator_free(mt_allocator_t *alloc, void *ptr);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* MATRYOSHKA_INTERNAL_H */
