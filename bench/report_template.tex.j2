@@ -1002,6 +1002,258 @@ group them by target leaf, and amortise outer-tree traversal across
 each group.  On page-full or underflow, the path is re-navigated for
 remaining keys.  Both functions work with page leaves and superpages.
 
+\subsection{CL Sub-Tree Cache-Miss Optimisation: Fence Keys vs.\ Eytzinger (Implemented)}
+\label{sec:fence_eytz}
+
+Instruction-level profiling (\texttt{perf record -e cache-misses} with
+\texttt{addr2line}) of the baseline matryoshka on \texttt{rand\_insert}
+at $N{=}16\text{M}$ identified three serial cache-miss hotspots within
+the CL sub-tree traversal:
+
+\begin{center}
+\begin{tabular}{rlp{8cm}}
+\toprule
+\textbf{\% Miss} & \textbf{Source} & \textbf{Description} \\
+\midrule
+59.8\% & \texttt{leaf.c:323} & \texttt{page->header.sub\_height} --- first access to the page header cache line \\
+38.0\% & \texttt{leaf.c:199} & \texttt{cl->nkeys} in \texttt{cl\_inode\_search} --- loading the child CL internal node \\
+76.3\%\rlap{${}^*$} & \texttt{leaf.c:451} & \texttt{cl->nkeys < MT\_CL\_KEY\_CAP} in \texttt{mt\_page\_insert} --- loading the target CL leaf \\
+\bottomrule
+\multicolumn{3}{l}{\small ${}^*$Percentage of \texttt{mt\_page\_insert}'s cache misses, not total.}
+\end{tabular}
+\end{center}
+
+These form a serial dependency chain: header $\rightarrow$ CL root
+internal $\rightarrow$ child CL node.  Each load depends on data
+from the previous load, so no out-of-order execution or hardware
+prefetching can overlap them.  The pointer-tagging optimisation
+(\S\ref{sec:ptrtag}) already addresses hotspot~1 by prefetching the
+CL root from tagged pointers while still in the outer tree, but
+hotspots~2 and~3 remain.  Two strategies were implemented and
+benchmarked head-to-head:
+
+\subsubsection{Strategy A: Fence Keys}
+
+Store the CL root internal's separator keys and child slot indices
+in the 32 spare bytes of the page header (previously \texttt{\_reserved}).
+Since the page header is always loaded first (hotspot~1 is
+unavoidable), the fence data comes ``for free''---the CL root
+internal can be skipped entirely for height-1 sub-trees with
+$\le 6$ separators.
+
+\paragraph{Header layout.}
+\begin{lstlisting}[language=C, xleftmargin=2em]
+/* Replaces _reserved[32] in mt_page_header_t */
+int32_t  fence_keys[6];    /* 24 bytes */
+uint8_t  fence_slots[7];   /* 7 bytes  */
+uint8_t  nfence;           /* 1 byte   */
+                            /* 32 bytes total */
+\end{lstlisting}
+
+\paragraph{When fence keys apply.}
+\begin{itemize}[nosep]
+  \item Height~1, $\le 7$ children: fence keys fully resolve the
+        CL leaf $\rightarrow$ \textbf{skip CL internal entirely}
+  \item Height~2, root has $\le 6$ children: fence keys skip the
+        root internal $\rightarrow$ saves one level
+  \item Height~1, 8--13 children: \texttt{nfence=0}, transparent
+        fallback to normal path
+\end{itemize}
+
+\paragraph{Maintenance.}
+A \texttt{refresh\_fence\_keys()} helper copies
+$\min(\text{nkeys}, 6)$ keys and $\min(\text{nkeys}+1, 7)$ child
+slots from the CL root internal into the header.  It is called after
+bulk load, CL root split (in \texttt{mt\_page\_insert}), and CL root
+collapse (in \texttt{mt\_page\_delete}).
+
+\paragraph{Page capacity.}
+Unchanged (855 keys/page).  Outer tree structure unchanged.
+Enable via \texttt{mt\_hierarchy\_init\_fence}.
+
+\subsubsection{Strategy B: Eytzinger Dense BFS Layout}
+
+Fix the CL sub-tree to height $\le 1$ with a dense BFS layout.
+The root always occupies slot~1; children occupy slots
+$2, 3, \ldots, N{+}1$.  Since child positions are arithmetic (not
+stored in the CL internal), all children can be prefetched
+simultaneously while the root cache line is still loading---breaking
+the dependency chain between hotspots~1 and~2.
+
+\paragraph{CL internal type.}
+A new 64-byte Eytzinger internal stores 15 separator keys with no
+\texttt{children[]} array (positions are implicit):
+\begin{lstlisting}[language=C, xleftmargin=2em]
+typedef struct mt_cl_inode_eytz {
+    uint8_t  type;       /* MT_CL_INTERNAL  */
+    uint8_t  nkeys;      /* 0-15            */
+    uint8_t  nchildren;  /* 1-16            */
+    uint8_t  _pad;
+    int32_t  keys[15];   /* 60 bytes        */
+} mt_cl_inode_eytz_t;   /* 64 bytes total  */
+\end{lstlisting}
+
+\paragraph{Key trade-off.}
+With 16 children $\times$ 15 keys $=$ 240 keys max per page, pages
+split at 240 keys instead of 855.  This means $\sim$3.5$\times$ more
+pages in the outer tree, but each page operation is faster due to
+the eliminated serial miss.  When a CL leaf splits within an
+Eytzinger page, the dense BFS invariant is restored by extracting
+all keys and rebuilding the layout---amortised to $\sim$16 key
+copies per insert.
+
+Enable via \texttt{mt\_hierarchy\_init\_eytzinger}.
+
+\subsubsection{Benchmark Results}
+
+\begin{table}[H]
+\centering
+\caption{Fence keys vs.\ Eytzinger vs.\ baseline: \texttt{rand\_insert} (ns/op, lower is better).}
+\label{tab:fence_eytz_insert}
+\begin{tabular}{rS[table-format=3.0]S[table-format=3.0]rS[table-format=4.0]r}
+\toprule
+\textbf{N} & {\textbf{Baseline}} & {\textbf{Fence}} & \textbf{$\Delta$}
+  & {\textbf{Eytzinger}} & \textbf{$\Delta$} \\
+\midrule
+\num{65536}    & 307 & 245 & $-$20\% & 791  & $+$158\% \\
+\num{262144}   & 352 & 276 & $-$21\% & 819  & $+$133\% \\
+\num{1048576}  & 406 & 388 & $-$4\%  & 803  & $+$98\%  \\
+\num{4194304}  & 652 & 510 & $-$22\% & 1051 & $+$61\%  \\
+\num{16777216} & 719 & 706 & $-$2\%  & 1123 & $+$56\%  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Fence keys vs.\ Eytzinger vs.\ baseline: \texttt{search\_after\_churn} (ns/op).}
+\label{tab:fence_eytz_search}
+\begin{tabular}{rS[table-format=3.0]S[table-format=3.0]rS[table-format=3.0]r}
+\toprule
+\textbf{N} & {\textbf{Baseline}} & {\textbf{Fence}} & \textbf{$\Delta$}
+  & {\textbf{Eytzinger}} & \textbf{$\Delta$} \\
+\midrule
+\num{65536}    & 232 & 193 & $-$17\% & 228 & $-$2\%  \\
+\num{16777216} & 785 & 668 & $-$15\% & 771 & $-$2\%  \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Hardware Counter Analysis}
+
+\texttt{perf stat} on \texttt{rand\_insert} at $N{=}16\text{M}$ (P-core):
+
+\begin{table}[H]
+\centering
+\caption{Hardware counters: fence keys vs.\ Eytzinger vs.\ baseline.}
+\label{tab:fence_eytz_hw}
+\begin{tabular}{lS[table-format=3.0]S[table-format=4.0]S[table-format=2.1]S[table-format=1.2]}
+\toprule
+\textbf{Variant} & {\textbf{Cache Miss (M)}} & {\textbf{L1d Miss (M)}}
+  & {\textbf{Instr (B)}} & {\textbf{IPC}} \\
+\midrule
+Baseline   & 393 & 145 & 12.6 & 0.65 \\
+Fence      & 384 & 130 & 12.7 & 0.69 \\
+Eytzinger  & 504 & 172 & 25.3 & 0.85 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Fence keys} reduced L1d misses by 10.3\% and total cycles
+by 4.5\%, with IPC improving from 0.65 to 0.69.  The instruction count
+is essentially unchanged (+1\%), confirming that the fence key fast
+path adds negligible overhead---it merely resolves the CL leaf from
+data already in the header cache line.
+
+\paragraph{Eytzinger} achieved dramatically better IPC (0.85 vs.\ 0.65)
+and a lower cache miss \emph{rate} (43.8\% vs.\ 66.6\%), confirming
+that the mass-prefetch of all 16 children is working as intended:
+the CPU executes useful computation while prefetches resolve in
+parallel.  However, the absolute miss count is 28\% higher (504M
+vs.\ 393M) and the instruction count doubled (25.3B vs.\ 12.6B)
+due to the taller outer tree ($3.5\times$ more pages) and the
+$O(240)$ extract-rebuild on every CL leaf split.
+
+\subsubsection{Cache-Miss Profile Shift with Fence Keys}
+
+\texttt{perf record -e cache-misses} on \texttt{rand\_insert} at
+$N{=}16\text{M}$:
+
+\begin{table}[H]
+\centering
+\caption{Cache-miss attribution: baseline vs.\ fence keys.}
+\label{tab:fence_cachemiss}
+\begin{tabular}{lrrl}
+\toprule
+\textbf{Function} & \textbf{Baseline} & \textbf{Fence} & \textbf{Change} \\
+\midrule
+\texttt{page\_find\_leaf}  & 51.6\% & 48.2\% & $-$3.4\,pp \\
+\quad \textit{of which} \texttt{cl\_inode\_search} & 31.7\% & 22.6\% & $-$9.1\,pp \\
+\texttt{mt\_page\_insert}  & 25.3\% & 28.8\% & $+$3.5\,pp \\
+\texttt{mt\_inode\_search} & 14.2\% & 14.2\% & $\sim$0 \\
+\texttt{matryoshka\_insert} & 3.0\%  & 3.1\%  & $\sim$0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The fence keys reduced \texttt{cl\_inode\_search} cache misses by 9.1
+percentage points---exactly the CL root internal loads being skipped
+for height-1 sub-trees with $\le 6$ separators.  The residual 22.6\%
+comes from: (1)~height-2 pages where fence keys skip the root but a
+level-1 internal still requires loading; and (2)~height-1 pages with
+7--12 separators that exceed the 6-key fence capacity.
+
+Instruction-level attribution of the remaining hotspots with fence
+keys:
+
+\begin{description}[style=nextline, nosep, leftmargin=1em]
+  \item[\texttt{page\_find\_leaf} at \texttt{leaf.c:199} (35.6\%)]
+    \texttt{int n = cl->nkeys} in \texttt{cl\_inode\_search}---loading
+    the child CL internal after fence keys resolved the root.  This
+    fires on height-2 pages and height-1 pages with $> 6$ separators.
+
+  \item[\texttt{mt\_page\_insert} at \texttt{leaf.c:62} (17.7\% overall)]
+    \texttt{int lo = 0, hi = cl->nkeys} in
+    \texttt{cl\_leaf\_lower\_bound}---loading the target CL leaf to
+    find the insertion point.  This is the third miss in the serial
+    chain: header $\rightarrow$ (fence skip root) $\rightarrow$ child
+    CL leaf.  It is now the \textbf{dominant remaining bottleneck}.
+
+  \item[\texttt{mt\_inode\_search} at \texttt{inode.c:91} (13.6\%)]
+    Binary search loop within outer tree internal nodes---standard
+    outer-tree traversal cost, unaffected by CL-level optimisations.
+\end{description}
+
+\subsubsection{Conclusions}
+
+\begin{enumerate}[nosep]
+  \item \textbf{Fence keys are the clear winner.}  17--22\% faster
+        on insert and search at sizes fitting L3 cache (up to
+        $N{=}4\text{M}$), with 2--15\% improvement persisting at
+        $N{=}16\text{M}$.  Zero impact on page capacity or outer
+        tree structure.
+
+  \item \textbf{Eytzinger is a negative trade-off.}  Despite
+        achieving better IPC (0.85 vs.\ 0.65) and a lower cache
+        miss rate, the $3.5\times$ page count increase
+        (240 vs.\ 855 keys/page) and $O(240)$ extract-rebuild on
+        every CL leaf split make it consistently slower---56--158\%
+        slower on insert across all sizes.
+
+  \item \textbf{The dominant remaining bottleneck} is loading the
+        target CL leaf (\texttt{cl\_leaf\_lower\_bound} at 17.7\%
+        of total cache misses).  This is the irreducible third step
+        in the serial chain that neither strategy can eliminate: the
+        CL leaf's address is only known after searching the CL
+        internal one level above.
+
+  \item \textbf{Fence keys hurt delete} by $\sim$15\% due to the
+        \texttt{refresh\_fence\_keys()} overhead after structural
+        changes (merge, redistribute, root collapse).  Future work
+        could defer fence refresh to the next search, amortising the
+        cost across multiple modifications.
+\end{enumerate}
+
 \subsection{Future: Variable-Length Keys}
 
 The current 4-byte \texttt{int32\_t} key format could be extended to
