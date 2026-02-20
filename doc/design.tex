@@ -24,7 +24,7 @@
 \usetikzlibrary{
   arrows.meta,
   positioning,
-  decorations.brace,
+  decorations.pathreplacing,
   calc,
   fit,
   patterns,
@@ -102,7 +102,7 @@
 {\Huge\bfseries Matryoshka Trees\par}
 \vspace{0.5cm}
 {\Large\itshape A Modification-Friendly, Cache-Conscious\\ B\textsuperscript{+} Tree
-  with SIMD-Blocked Nodes\par}
+  with Parametrisable Hierarchical SIMD Blocking\par}
 \vspace{2cm}
 {\large Design Document\par}
 \vspace{1cm}
@@ -112,9 +112,15 @@
 This document describes the design of the \emph{matryoshka tree}, a B\textsuperscript{+}
 tree variant that embeds FAST-style hierarchical blocking~\cite{kim2010fast} within
 each leaf node while retaining the standard B\textsuperscript{+} tree's support for
-efficient insertions, deletions, and range scans.  The name reflects the nested
-(``Russian doll'') architecture: SIMD blocks nest inside cache-line blocks, which
-nest inside page-sized B\textsuperscript{+} nodes, which compose the full tree.}
+efficient insertions, deletions, and range scans.  The blocking hierarchy is
+\emph{parametrisable at runtime}: the number of blocking levels, their depths, and
+the leaf allocation size (from \SI{4}{\kilo\byte} pages to \SI{2}{\mebi\byte}
+superpages) are configured per-tree via an \code{mt\_hierarchy\_t} descriptor.
+Deletion uses Jannink's eager algorithm with redistribute and merge, propagating
+rebalancing up to the root.  Leaf nodes are co-located within superpage-aligned
+arenas for TLB locality.  The name reflects the nested (``Russian doll'')
+architecture: SIMD blocks nest inside cache-line blocks, which nest inside
+page-sized or superpage-sized B\textsuperscript{+} nodes, which compose the full tree.}
 \end{titlepage}
 
 \tableofcontents
@@ -150,10 +156,20 @@ leaf nodes), and using standard pointer-based navigation \emph{between}
 nodes.  The result is:
 
 \begin{itemize}[nosep]
-  \item \textbf{Fast intra-node search}: Each leaf contains up to 511
-    keys in a FAST-blocked layout, searched via SIMD in
-    $\ceil{\dn/\dk}$ SSE operations, where $\dn$ is the tree depth
-    within the leaf and $\dk = 2$ is the SIMD block depth.
+  \item \textbf{Fast intra-node search}: Each leaf contains up to $B$
+    keys (511 for \SI{4}{\kilo\byte} pages, 262143 for \SI{2}{\mebi\byte}
+    superpages) in a FAST-blocked layout, searched via SIMD in
+    $\ceil{\dn/\dk}$ SSE operations.
+  \item \textbf{Parametrisable hierarchy}: The number of blocking levels,
+    their depths, and the leaf allocation size are configured per-tree
+    at runtime, enabling architecture-specific tuning (e.g.\ SPARC's
+    \SI{8}{\kilo\byte} base pages with power-of-8 superpages).
+  \item \textbf{Eager deletion}: Jannink's redistribute/merge algorithm
+    maintains minimum leaf occupancy invariants, with cascading
+    rebalancing through internal nodes up to the root.
+  \item \textbf{Arena allocation}: Leaf nodes are co-located within
+    superpage-aligned arenas (via \code{mmap(MAP\_HUGETLB)} on Linux),
+    reducing TLB misses during tree traversal.
   \item \textbf{Efficient modifications}: Insertions and deletions
     rebuild only the affected leaf ($\Oh(B)$ work) and propagate splits
     or merges up $\Oh(\log_B n)$ internal levels, for overall
@@ -318,7 +334,8 @@ Masstree~\cite{mao2012cache}
 \section{Architecture Overview}
 \label{sec:architecture}
 
-A matryoshka tree is a B\textsuperscript{+} tree with two node types:
+A matryoshka tree is a B\textsuperscript{+} tree with two node types
+and a runtime-configurable blocking hierarchy:
 
 \begin{description}[leftmargin=2em, labelindent=0em]
   \item[Internal nodes] store sorted keys and child pointers in a
@@ -328,8 +345,18 @@ A matryoshka tree is a B\textsuperscript{+} tree with two node types:
     page, holding up to 339 keys and 340 child pointers.
 
   \item[Leaf nodes] store keys in a FAST-style hierarchically blocked
-    layout.  Each leaf fits in one \SI{4}{\kilo\byte} page, holding up
-    to 511 keys.  Leaves are doubly linked for range scans.
+    layout.  Leaf size is determined by the hierarchy configuration:
+    \SI{4}{\kilo\byte} pages (511 keys, \code{int16\_t} rank) or
+    \SI{2}{\mebi\byte} superpages (262143 keys, \code{int32\_t} rank).
+    Leaves are doubly linked for range scans.
+
+  \item[Hierarchy configuration] (\code{mt\_hierarchy\_t}) specifies the
+    blocking levels (finest to coarsest), each with a tree depth and
+    hardware unit size.  Factory functions provide defaults for x86-64
+    (SIMD + cache-line, \SI{4}{\kilo\byte} pages), x86-64 with superpages
+    (SIMD + cache-line + page, \SI{2}{\mebi\byte}), and custom
+    architectures.  The hierarchy is stored per-tree and governs leaf
+    build, search, and allocation.
 \end{description}
 
 Figure~\ref{fig:tree-structure} shows the overall tree structure.
@@ -444,10 +471,13 @@ Figure~\ref{fig:tree-structure} shows the overall tree structure.
 \section{Node Structures}
 \label{sec:nodes}
 
-Both node types are allocated as page-aligned \SI{4}{\kilo\byte} buffers
-via \code{posix\_memalign}.  This alignment ensures that each node
-occupies exactly one virtual memory page, minimising TLB pressure during
-tree traversal.
+Internal nodes are allocated as page-aligned \SI{4}{\kilo\byte} buffers
+via \code{posix\_memalign}.  Leaf nodes are allocated from a
+\emph{superpage arena allocator} (\code{mt\_allocator\_t}), which
+sub-divides superpage-aligned regions (allocated via
+\code{mmap(MAP\_HUGETLB)} on Linux, with \code{posix\_memalign} fallback)
+into page-sized slots tracked by a bitmap.  Co-locating leaves within the
+same superpage reduces TLB misses during sequential scans and tree traversals.
 
 % ── Internal Node ─────────────────────────────────────────────────
 \subsection{Internal Node (\code{mt\_inode\_t})}
@@ -1291,14 +1321,14 @@ the tree:
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[
-  step/.style={draw, rounded corners=3pt, minimum width=3.5cm,
+  stepbox/.style={draw, rounded corners=3pt, minimum width=3.5cm,
                minimum height=0.8cm, font=\small, align=center},
   arrow/.style={-{Stealth[length=5pt]}, thick},
   lbl/.style={font=\scriptsize\itshape, text=gray!60!black},
 ]
-  \node[step, fill=inodecolor] (s1) at (0, 0) {Walk internal levels};
-  \node[step, fill=leafcolor] (s2) at (0, -1.5) {SIMD leaf search};
-  \node[step, fill=rankcolor] (s3) at (0, -3.0) {Resolve predecessor};
+  \node[stepbox, fill=inodecolor] (s1) at (0, 0) {Walk internal levels};
+  \node[stepbox, fill=leafcolor] (s2) at (0, -1.5) {SIMD leaf search};
+  \node[stepbox, fill=rankcolor] (s3) at (0, -3.0) {Resolve predecessor};
 
   \draw[arrow] (s1) -- (s2) node[midway, right, lbl] {$\Oh(\log_B n)$ pointer follows};
   \draw[arrow] (s2) -- (s3) node[midway, right, lbl] {$\ceil{\dn/\dk}$ SIMD comparisons};
@@ -1420,15 +1450,132 @@ where $B = 511$.  Splits propagate through at most $\Oh(\log_B n)$
 internal levels, each requiring $\Oh(B)$ work.  Thus the total insert
 cost is $\Oh(B \cdot \log_B n)$.
 
-\subsection{Delete}
+\subsection{Delete (Eager, Jannink's Algorithm)}
 \label{sec:delete}
 
-Deletion uses the same find-leaf, extract-sorted, modify, rebuild pattern
-as insertion.  The current implementation uses \textbf{lazy deletion}: it
-does not merge or redistribute underfull leaves.  A leaf that becomes
-completely empty is unlinked from the leaf chain and removed from its
-parent; if the parent becomes empty and is the root, the tree height
-decreases.
+Deletion uses \textbf{eager rebalancing} following
+Jannink~\cite{jannink1995implementing}, maintaining the invariant that
+every non-root leaf has at least $\floor{B/2}$ keys.  The algorithm
+proceeds as follows:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Find and remove}: Walk from root to leaf (recording the path),
+    extract sorted keys, remove the target key, rebuild the leaf's FAST layout.
+  \item \textbf{Check underflow}: If the leaf is the root or has $\ge \floor{B/2}$
+    keys, stop.
+  \item \textbf{Redistribute}: Try the left sibling first, then the right.  If a
+    sibling has more than $\floor{B/2}$ keys, redistribute keys to balance both
+    leaves (each gets $\floor{(\text{left} + \text{right}) / 2}$ keys).  Update the
+    separator in the parent.  Both leaves' FAST layouts are rebuilt.
+  \item \textbf{Merge}: If neither sibling can spare keys, merge with a sibling
+    (prefer left).  Combine both leaves' sorted keys into one, rebuild the FAST
+    layout, unlink the empty leaf from the doubly-linked list, remove the separator
+    from the parent, and free the empty leaf.
+  \item \textbf{Propagate upward}: If the parent internal node underflows
+    ($< \floor{339/2}$ keys), apply the same redistribute-or-merge logic at the
+    internal level.  Internal redistribute rotates a separator through the parent:
+    pull a separator key down from the grandparent, push a boundary key up from the
+    sibling.  Internal merge combines two nodes with the intervening separator.
+    Repeat up to the root.
+  \item \textbf{Root collapse}: If the root has 0 keys and 1 child, replace the
+    root with its child, decreasing tree height.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node/.style={draw, rounded corners=2pt, minimum height=0.9cm,
+               font=\scriptsize, align=center},
+  leaf/.style={node, fill=leafcolor, minimum width=2.0cm},
+  inode/.style={node, fill=inodecolor, minimum width=2.5cm},
+  arrow/.style={-{Stealth[length=4pt]}, thick},
+  lbl/.style={font=\scriptsize\itshape, text=gray!60!black},
+]
+  % Before
+  \node[font=\small\bfseries] at (-0.5, 2.8) {Before:};
+
+  \node[inode] (p1) at (3, 2.5) {parent: $[50, 100]$};
+  \node[leaf]  (a1) at (0.5, 0.8) {$L_a$: 260 keys};
+  \node[leaf]  (b1) at (3.0, 0.8) {$L_b$: 200 keys};
+  \node[leaf]  (c1) at (5.5, 0.8) {$L_c$: 400 keys};
+
+  \draw[arrow, ptrcolor] (p1.south) ++(-1.0cm,0) -- (a1.north);
+  \draw[arrow, ptrcolor] (p1.south) -- (b1.north);
+  \draw[arrow, ptrcolor] (p1.south) ++(1.0cm,0) -- (c1.north);
+
+  % After redistribute
+  \node[font=\small\bfseries] at (8.5, 2.8) {After redistribute:};
+
+  \node[inode] (p2) at (12, 2.5) {parent: $[50, 85]$};
+  \node[leaf]  (a2) at (9.5, 0.8) {$L_a$: 230 keys};
+  \node[leaf]  (b2) at (12.0, 0.8) {$L_b$: 230 keys};
+  \node[leaf]  (c2) at (14.5, 0.8) {$L_c$: 400 keys};
+
+  \draw[arrow, ptrcolor] (p2.south) ++(-1.0cm,0) -- (a2.north);
+  \draw[arrow, ptrcolor] (p2.south) -- (b2.north);
+  \draw[arrow, ptrcolor] (p2.south) ++(1.0cm,0) -- (c2.north);
+
+  % Annotation
+  \draw[arrow, red!60!black, dashed, thick] (b1.east) ++(0.3,0.3) -- ++(3.5,0)
+    node[midway, above, lbl] {delete causes underflow $\to$ redistribute from $L_a$};
+\end{tikzpicture}
+\caption{\textbf{Eager deletion: leaf redistribute.}
+  After deleting a key from $L_b$ (200 keys, below the minimum of 255),
+  keys are redistributed from the left sibling $L_a$ (which has 260 spare keys).
+  Both leaves end up with 230 keys each, and the parent separator is updated
+  from 100 to 85 (the new first key of $L_b$).  Both leaves' FAST layouts
+  are rebuilt.}
+\label{fig:delete-redistribute}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  node/.style={draw, rounded corners=2pt, minimum height=0.9cm,
+               font=\scriptsize, align=center},
+  leaf/.style={node, fill=leafcolor, minimum width=2.0cm},
+  inode/.style={node, fill=inodecolor, minimum width=2.5cm},
+  arrow/.style={-{Stealth[length=4pt]}, thick},
+  lbl/.style={font=\scriptsize\itshape, text=gray!60!black},
+  deadnode/.style={draw, dashed, rounded corners=2pt, minimum height=0.9cm,
+                   font=\scriptsize, align=center, text=gray, fill=gray!10,
+                   minimum width=2.0cm},
+]
+  % Before
+  \node[font=\small\bfseries] at (-0.5, 2.8) {Before:};
+
+  \node[inode] (p1) at (3, 2.5) {parent: $[50, 100]$};
+  \node[leaf]  (a1) at (0.5, 0.8) {$L_a$: 250 keys};
+  \node[leaf]  (b1) at (3.0, 0.8) {$L_b$: 200 keys};
+  \node[leaf]  (c1) at (5.5, 0.8) {$L_c$: 300 keys};
+
+  \draw[arrow, ptrcolor] (p1.south) ++(-1.0cm,0) -- (a1.north);
+  \draw[arrow, ptrcolor] (p1.south) -- (b1.north);
+  \draw[arrow, ptrcolor] (p1.south) ++(1.0cm,0) -- (c1.north);
+
+  % After merge
+  \node[font=\small\bfseries] at (8.5, 2.8) {After merge:};
+
+  \node[inode]    (p2) at (11.5, 2.5) {parent: $[100]$};
+  \node[leaf]     (ab) at (9.8, 0.8) {$L_a$: 450 keys};
+  \node[leaf]     (c2) at (13.0, 0.8) {$L_c$: 300 keys};
+
+  \draw[arrow, ptrcolor] (p2.south) ++(-0.5cm,0) -- (ab.north);
+  \draw[arrow, ptrcolor] (p2.south) ++(0.5cm,0) -- (c2.north);
+
+  % Annotation
+  \draw[arrow, red!60!black, dashed, thick] (b1.east) ++(0.3,0.3) -- ++(3.5,0)
+    node[midway, above, lbl] {neither sibling can spare $\to$ merge $L_a + L_b$};
+\end{tikzpicture}
+\caption{\textbf{Eager deletion: leaf merge.}
+  Neither sibling ($L_a$ with 250 and $L_c$ with 300) can spare keys
+  (both are at or near minimum).  $L_b$ is merged into $L_a$ (combined
+  450 keys), the separator key 50 and $L_b$'s child pointer are removed
+  from the parent, and $L_b$ is freed.  If this causes the parent to
+  underflow, the same redistribute-or-merge logic is applied at the
+  internal node level, cascading up to the root.}
+\label{fig:delete-merge}
+\end{figure}
 
 \subsection{Range Scan (Iteration)}
 \label{sec:iteration}
@@ -1507,7 +1654,7 @@ Bulk load       & $\Oh(n)$ & Bottom-up, one pass \\
 Point search    & $\Oh(h + \dn/\dk)$ & $h$ pointer follows + SIMD leaf search \\
 Predecessor     & $\Oh(h + \dn/\dk)$ & Same as point search + rank lookup \\
 Insert          & $\Oh(B \cdot h)$ worst case & Leaf rebuild + possible splits \\
-Delete          & $\Oh(B)$ amortised & Leaf rebuild; lazy (no merge) \\
+Delete          & $\Oh(B \cdot h)$ worst case & Eager (Jannink): redistribute/merge, cascading \\
 Range scan      & $\Oh(h + m)$ & $h$ for initial seek, $m$ keys scanned \\
 Iteration (next)& $\Oh(1)$ amortised & $\Oh(B)$ per leaf transition \\
 \bottomrule
@@ -1571,13 +1718,26 @@ cost advantageous.
 
 \subsection{Memory Allocation}
 
-All nodes are allocated via \code{posix\_memalign} with \SI{4096}{\byte}
-alignment and size, ensuring one-page-per-node correspondence:
+Internal nodes are allocated via \code{posix\_memalign} with
+\SI{4096}{\byte} alignment.  Leaf nodes are allocated from a
+\emph{superpage arena allocator} (\code{mt\_allocator\_t}), which manages
+one or more superpage-aligned regions:
 
 \begin{lstlisting}
-posix_memalign(&p, MT_PAGE_SIZE, MT_PAGE_SIZE);  /* 4096, 4096 */
-memset(p, 0, MT_PAGE_SIZE);
+/* Arena allocation (Linux) */
+mmap(NULL, arena_size, PROT_READ | PROT_WRITE,
+     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+/* Fallback: posix_memalign(&p, arena_size, arena_size) */
 \end{lstlisting}
+
+Each arena is subdivided into page-sized slots tracked by a bitmap
+(\code{uint64\_t} words, one bit per page).  Allocation scans the bitmap
+for a free bit; deallocation clears it.  When all arenas are full, a new
+arena is allocated.
+
+Co-locating leaves within the same superpage-aligned arena reduces TLB
+misses during sequential scans: leaves allocated during bulk load end up
+in the same 2\,MiB region, covered by a single TLB entry.
 
 The \code{mt\_node\_t} union allows type-punning between internal and leaf
 nodes via a shared \code{type} field at offset~0.
@@ -1585,7 +1745,7 @@ nodes via a shared \code{type} field at offset~0.
 \subsection{Leaf Build Algorithm}
 
 The \code{mt\_leaf\_build} function constructs the FAST-blocked layout from
-a sorted key array in three steps:
+a sorted key array, parameterised by the tree's \code{mt\_hierarchy\_t}:
 
 \begin{enumerate}[nosep]
   \item \textbf{Compute tree depth}: $\dn = \ceil{\log_2(n+1)}$, giving
@@ -1597,9 +1757,18 @@ a sorted key array in three steps:
     \code{bfs\_tree[$i$] = sorted\_keys[bfs\_to\_sorted[$i$]]}, or
     $+\infty$ if the rank exceeds $n$.
   \item \textbf{Recursive layout}: \code{lay\_out\_subtree} decomposes the
-    BFS tree into SIMD blocks, writing each block's keys and ranks
-    contiguously to the output arrays.
+    BFS tree according to the blocking depths from
+    \code{hier->levels[0..num\_levels-1]}, writing each block's keys and
+    \code{sorted\_rank} values contiguously to the output arrays.
+    The recursion starts at the coarsest level and decomposes downward
+    to the finest (SIMD) level, matching the search traversal exactly.
 \end{enumerate}
+
+The blocking depths are read from the hierarchy at runtime, not hardcoded.
+For example, with the default hierarchy (\code{mt\_hierarchy\_init\_default}),
+depths are $[\dk{=}2, \dl{=}4]$; with the superpage hierarchy, depths are
+$[2, 4, 10]$.  Zero-fill of unused slots uses \code{hier->tree\_cap} as
+the bound.
 
 \subsection{Limitations and Future Work}
 
@@ -1610,23 +1779,24 @@ a sorted key array in three steps:
     directly computing the predecessor during the SIMD traversal,
     avoiding the reconstruction entirely.
 
-  \item \textbf{Cache-line blocking}: The implementation currently uses
-    only SIMD-level blocking ($\dk = 2$).  Adding cache-line blocking
-    ($\dl = 4$) would group five SIMD blocks into a \SI{64}{\byte}
-    cache-line--sized unit, potentially improving cache utilisation for
-    large leaves.
-
   \item \textbf{Concurrency}: No locking or versioning is implemented.
     Optimistic lock coupling~\cite{lehman1981efficient} or epoch-based
     reclamation would be needed for concurrent access.
 
-  \item \textbf{Lazy deletion}: The current delete does not merge or
-    redistribute underfull leaves, which may waste space under heavy
-    deletion workloads.
-
   \item \textbf{Variable-length keys}: The current design is specialised
     for 32-bit integers.  Supporting variable-length keys would require
     indirection or key normalisation, similar to Masstree's approach.
+
+  \item \textbf{Cross-node superpage blocking}: The current arena
+    allocator co-locates leaves for TLB locality, but the blocking
+    hierarchy does not extend across B\textsuperscript{+} node boundaries.
+    True cross-node superpage-level blocking (grouping multiple leaves
+    into a single contiguous FAST layout) would further reduce search
+    latency for very large datasets.
+
+  \item \textbf{Architecture-specific tuning}: Factory functions currently
+    target x86-64.  Adding presets for ARM (NEON), SPARC
+    (\SI{8}{\kilo\byte} pages), and POWER would broaden applicability.
 \end{itemize}
 
 
@@ -1643,18 +1813,44 @@ a sorted key array in three steps:
 \toprule
 \textbf{Constant} & \textbf{Value} & \textbf{Description} \\
 \midrule
-\code{MT\_PAGE\_SIZE}      & 4096  & Page size in bytes; node allocation unit \\
-\code{MT\_DK}              & 2     & SIMD block depth \\
+\code{MT\_PAGE\_SIZE}      & 4096  & Page size in bytes; internal node allocation unit \\
+\code{MT\_DK}              & 2     & SIMD block depth (finest level) \\
 \code{MT\_NK}              & 3     & Keys per SIMD block ($2^{\dk}-1$) \\
-\code{MT\_DL}              & 4     & Cache-line block depth (reserved) \\
+\code{MT\_DL}              & 4     & Cache-line block depth \\
 \code{MT\_NL}              & 15    & Keys per cache-line block ($2^{\dl}-1$) \\
 \code{MT\_MAX\_IKEYS}      & 339   & Max keys per internal node \\
 \code{MT\_MIN\_IKEYS}      & 169   & Min keys per internal node ($\floor{339/2}$) \\
-\code{MT\_LNODE\_TREE\_CAP}& 512   & Array capacity in leaf ($\ge 2^9 - 1$) \\
-\code{MT\_MAX\_LKEYS}      & 511   & Max keys per leaf ($2^9 - 1$) \\
-\code{MT\_MIN\_LKEYS}      & 255   & Min keys per leaf ($\floor{511/2}$) \\
+\code{MT\_LNODE\_TREE\_CAP}& 512   & Array capacity in default leaf ($\ge 2^9 - 1$) \\
+\code{MT\_MAX\_LKEYS}      & 511   & Max keys per default leaf ($2^9 - 1$) \\
+\code{MT\_MAX\_LEVELS}     & 8     & Maximum blocking hierarchy levels \\
 \code{MT\_MAX\_HEIGHT}     & 32    & Maximum tree height (stack depth) \\
 \code{MT\_KEY\_MAX}         & $2^{31}-1$ & Sentinel value (\code{INT32\_MAX}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Runtime hierarchy fields.}
+Leaf capacity, minimum leaf keys, tree depth, and rank width are no longer
+compile-time constants.  They are computed per-tree from the
+\code{mt\_hierarchy\_t} configuration:
+
+\begin{table}[H]
+\centering
+\caption{\textbf{Runtime hierarchy fields} in \code{mt\_hierarchy\_t}.}
+\label{tab:hierarchy-fields}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Field} & \textbf{Default} & \textbf{Description} \\
+\midrule
+\code{num\_levels} & 2      & Number of blocking levels \\
+\code{levels[]}    & $[\{2,16\},\{4,64\}]$ & Per-level depth and hardware size \\
+\code{leaf\_alloc} & 4096   & Leaf allocation size in bytes \\
+\code{leaf\_depth} & 9      & Maximum tree depth within a leaf \\
+\code{leaf\_cap}   & 511    & Maximum keys per leaf ($2^{\text{leaf\_depth}}-1$) \\
+\code{tree\_cap}   & 512    & Array capacity ($2^{\text{leaf\_depth}}$) \\
+\code{min\_lkeys}  & 255    & Minimum keys per non-root leaf ($\floor{\text{leaf\_cap}/2}$) \\
+\code{rank\_wide}  & false  & True if \code{leaf\_cap} $> 32767$ (use \code{int32\_t} rank) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -1667,23 +1863,36 @@ a sorted key array in three steps:
 The matryoshka tree provides a practical middle ground between static
 SIMD-optimised indexes (FAST) and traditional pointer-based
 B\textsuperscript{+} trees.  By confining FAST-style hierarchical
-blocking to within each page-sized leaf node and connecting nodes via
-standard B\textsuperscript{+} tree pointers, it achieves:
+blocking to within each leaf node and connecting nodes via standard
+B\textsuperscript{+} tree pointers, it achieves:
 
 \begin{enumerate}[nosep]
-  \item SIMD-parallel intra-node search with $\ceil{\dn/\dk}$ comparisons
-    per leaf;
-  \item $\Oh(B \cdot \log_B n)$ insertion and deletion via node-local
-    rebuilds and standard B\textsuperscript{+} splits/merges;
-  \item Efficient range scans via a doubly-linked leaf chain; and
-  \item Cache-friendly memory layout with page-aligned nodes and
-    contiguous blocked key arrays.
+  \item \textbf{SIMD-parallel intra-node search} with $\ceil{\dn/\dk}$
+    comparisons per leaf, using the full multi-level blocking hierarchy
+    (SIMD $\to$ cache-line $\to$ page);
+  \item \textbf{Parametrisable hierarchy}: the number of blocking levels,
+    their depths, and the leaf allocation size (from \SI{4}{\kilo\byte}
+    pages to \SI{2}{\mebi\byte} superpages) are configured per-tree via
+    \code{mt\_hierarchy\_t}, enabling architecture-specific tuning;
+  \item \textbf{Eager deletion} via Jannink's algorithm, maintaining
+    minimum occupancy invariants through redistribute and merge
+    operations that cascade through internal nodes to the root;
+  \item \textbf{Superpage arena allocation}: leaf nodes are co-located
+    within superpage-aligned arenas (via \code{mmap(MAP\_HUGETLB)} on
+    Linux), reducing TLB misses during tree traversal;
+  \item \textbf{Efficient modifications}: insertions and deletions rebuild
+    only the affected leaf ($\Oh(B)$ work) and propagate splits or merges
+    up $\Oh(\log_B n)$ internal levels;
+  \item \textbf{Efficient range scans} via a doubly-linked leaf chain; and
+  \item \textbf{Variable-width rank}: leaves with $> 32767$ keys
+    automatically use \code{int32\_t} for \code{sorted\_rank}, supporting
+    superpage-sized leaves with up to 262143 keys.
 \end{enumerate}
 
 The nested architecture---SIMD blocks inside cache-line blocks inside
-B\textsuperscript{+} nodes---mirrors the memory hierarchy itself,
-giving the structure its name: like a matryoshka doll, each level
-contains a smaller, self-similar structure within.
+page-sized or superpage-sized B\textsuperscript{+} nodes---mirrors the
+memory hierarchy itself, giving the structure its name: like a matryoshka
+doll, each level contains a smaller, self-similar structure within.
 
 
 % ══════════════════════════════════════════════════════════════════
@@ -1746,6 +1955,11 @@ J.~Rao and K.~A. Ross.
 B.~Schlegel, R.~Gemulla, and W.~Lehner.
 \newblock {K}-ary search on modern processors.
 \newblock In \emph{Proc.\ DaMoN Workshop}, pages 52--60, 2009.
+
+\bibitem{jannink1995implementing}
+J.~Jannink.
+\newblock Implementing deletion in {B}\textsuperscript{+}-trees.
+\newblock \emph{ACM SIGMOD Record}, 24(1):33--38, 1995.
 
 \bibitem{zhou2002implementing}
 J.~Zhou and K.~A. Ross.
