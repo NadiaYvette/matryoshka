@@ -493,66 +493,133 @@ Matryoshka rows highlighted in \colorbox{rowhl}{blue}.
 \subsection{Benchmark Access Patterns}
 
 The seven workloads exercise distinct access patterns that interact
-differently with each data structure's memory layout:
+differently with each data structure's memory layout.  Understanding
+what each workload actually measures is essential for interpreting the
+results table: raw Mop/s numbers are meaningless without knowing which
+bottleneck---modification overhead, cache pressure, rebalancing cost,
+or in-leaf search efficiency---dominates a given workload.
 
-\begin{description}[style=nextline, nosep, leftmargin=1em]
-  \item[\texttt{seq\_insert}]
-    Keys arrive in ascending order (1, 3, 5, \ldots).  Structures with
-    append-optimised paths benefit: B-trees fill leaves left-to-right
-    with no splits until full; red-black trees rebalance but maintain
-    temporal locality in the allocator.  ART builds monotonically deeper
-    paths in byte-order.  Matryoshka benefits from sequential CL sub-node
-    filling within each page, but the nested sub-tree overhead (navigating
-    CL internals) makes each insert more expensive than a simple sorted-array
-    append.
+\begin{description}[style=nextline, leftmargin=1em, itemsep=0.6em]
+  \item[\texttt{seq\_insert} --- Sequential Append]
+    Keys arrive in ascending order (1, 3, 5, \ldots).  This is the
+    \emph{easiest} case for B-trees: leaves fill left-to-right with no
+    splits until full, and the rightmost leaf stays hot in cache across
+    consecutive inserts.  Red-black trees rebalance on each insert but
+    maintain temporal locality in the allocator; ART builds monotonically
+    deeper paths in byte-order with no node splitting.
 
-  \item[\texttt{rand\_insert}]
+    Matryoshka benefits from sequential CL sub-node filling within each
+    page, but the nested sub-tree overhead---navigating two levels of CL
+    internal nodes (2--3 SIMD comparisons) to reach the target CL leaf,
+    then \texttt{memmove} within that 64\,B node---makes each insert more
+    expensive than a simple sorted-array append in a flat B-tree leaf.
+    This workload primarily tests \textbf{per-operation modification
+    overhead}, not cache behaviour, since the hot working set fits in L1/L2
+    regardless of structure.
+
+  \item[\texttt{rand\_insert} --- Random Cache Pressure]
     A Fisher--Yates shuffle of $[0, N)$ scaled to odd values.  Every
     insert touches a random leaf, maximising cache pressure.  This is the
-    workload most sensitive to node size and memory layout: wide B-tree
-    leaves amortise random access; pointer-chasing structures
-    (\texttt{std::set}) incur a cache miss per tree level; ART's
-    fixed-depth (4-byte key $\Rightarrow$ $\le 4$ levels) limits misses.
+    workload most sensitive to node size and memory layout---the
+    \textbf{primary benchmark for cache-conscious designs}.
 
-  \item[\texttt{rand\_delete}]
-    Bulk-loads $N$ sorted keys, then deletes all in shuffled order.
-    The bulk-load gives every structure its optimal starting layout.
-    Random deletion stresses rebalancing: red-black trees do O(1)
-    rotations; B-trees \texttt{memmove} within leaves and occasionally
-    merge or redistribute; matryoshka merges CL sub-nodes within a page,
-    with page-level merges only on underflow.
+    \begin{itemize}[nosep]
+      \item \textbf{Wide B-tree leaves} (tlx, abseil at 256--4096\,B)
+            amortise random access: one cache miss loads many keys, so a
+            linear or SIMD scan within the leaf is cheap relative to the
+            miss.
+      \item \textbf{Pointer-chasing structures} (\texttt{std::set}) incur
+            a cache miss per tree level ($\sim\!\log_2 N$ levels); at
+            $N = 16\text{M}$ that is $\sim$24 dependent misses.
+      \item \textbf{ART}'s fixed-depth byte-trie (4-byte key
+            $\Rightarrow$ $\le 4$ levels) limits pointer-chase misses to
+            at most~4, but each node may be 48--256\,B depending on type.
+      \item \textbf{Matryoshka}'s 4\,KiB pages are cache-friendly, but
+            the nested CL sub-tree adds 2--3 cache-line touches within
+            each page.  The pointer-tagging optimisation
+            (\S\ref{sec:ptrtag}) specifically targets this workload:
+            prefetching the CL root while still in the outer tree removes
+            one serial miss from the critical path.
+    \end{itemize}
 
-  \item[\texttt{mixed}]
+  \item[\texttt{rand\_delete} --- Rebalance Stress Test]
+    Bulk-loads $N$ sorted keys (giving every structure its optimal starting
+    layout), then deletes all keys in shuffled order.  This isolates
+    \textbf{rebalancing cost} from insertion:
+
+    \begin{itemize}[nosep]
+      \item Red-black trees perform $O(1)$ rotations per deletion with
+            small constant factors (3 pointer writes + colour flip).
+      \item B-trees \texttt{memmove} within leaves and occasionally merge
+            or redistribute siblings, touching 1--2 nodes.
+      \item Matryoshka merges CL sub-nodes within a page (cheap---same
+            cache line or adjacent lines, no system calls) and only
+            performs expensive page-level merges when total occupancy drops
+            below $\lfloor 855/4 \rfloor = 213$ keys.  The two-level
+            underflow propagation (CL merge $\rightarrow$ page merge) is
+            more complex than a flat B-tree merge but amortises well since
+            most deletions only affect CL sub-nodes.
+    \end{itemize}
+
+  \item[\texttt{mixed} --- Steady-State Churn]
     Alternating insert (new key beyond current max) and delete (random
-    existing key) on a pre-loaded tree.  This creates a steady-state
-    workload where the tree size fluctuates around $N$.  Structures
-    that handle interleaved modifications without excessive rebalancing
-    perform well.
+    existing key) on a pre-loaded tree of size~$N$.  The tree size
+    fluctuates around $N$, creating a \textbf{realistic steady-state}
+    workload.  This tests whether structures waste work on structural
+    oscillation: a tree that aggressively splits a node on insert and
+    immediately merges it on the next delete pays the cost of both
+    operations with no net benefit.  Structures with hysteresis between
+    split and merge thresholds (matryoshka uses $\text{max}/4$ for
+    underflow vs.\ $\text{max}$ for split) handle this efficiently.
 
-  \item[\texttt{ycsb\_a} (95\% insert / 5\% search)]
-    Simulates a write-dominated OLTP workload.  Inserts are sequential
-    (monotonically increasing keys), so append-path efficiency matters.
-    The 5\% predecessor searches touch recently-inserted regions, favouring
-    structures with good temporal locality in their leaf layer.
+  \item[\texttt{ycsb\_a} (95\% insert / 5\% search) --- Write-Heavy OLTP]
+    Modelled on the Yahoo!\ Cloud Serving Benchmark ``Workload~A.''
+    Inserts are sequential (monotonically increasing keys), so
+    \textbf{append-path efficiency} dominates the 95\% write portion.
+    The 5\% predecessor searches target recently-inserted regions that
+    are likely still hot in L1/L2 cache, favouring structures with good
+    temporal locality in their leaf layer.  This workload reveals whether
+    a structure's insert path is cheap enough to sustain high write
+    throughput without being dragged down by occasional search overhead.
 
-  \item[\texttt{ycsb\_b} (50\% delete / 50\% search)]
-    Deletes from a pre-loaded tree interleaved with random predecessor
-    searches.  The shrinking tree tests whether structures maintain
-    search efficiency as occupancy drops and structural changes
-    (merges, rebalancing) occur.
+  \item[\texttt{ycsb\_b} (50\% delete / 50\% search) --- Shrinking Tree]
+    Deletes keys from a pre-loaded tree interleaved with random
+    predecessor searches.  As the tree shrinks, occupancy drops and the
+    ratio of useful data to allocated memory worsens.  This tests whether
+    \textbf{structural changes degrade search performance}: partially-filled
+    pages waste cache capacity (fewer keys per cache miss), and ongoing
+    merges may leave the tree in a suboptimal layout for search.
+    Structures that reclaim space eagerly (matryoshka's CL sub-node
+    merging) maintain higher effective density than those that leave
+    tombstones or half-empty nodes.
 
-  \item[\texttt{search\_after\_churn}]
-    Pure search workload on a tree that has undergone insert/delete churn
-    (untimed).  \num{5000000} random predecessor searches isolate search
-    throughput from modification cost.  This workload is most sensitive
-    to in-leaf search cost and memory layout, not structural operations.
-    Note: ART lacks native predecessor search; its wrapper falls back to
-    point lookup, giving it an advantage on hit rate but testing a
-    different operation.
+  \item[\texttt{search\_after\_churn} --- Pure Search Isolation]
+    The tree undergoes insert/delete churn (untimed setup phase), then
+    runs \num{5000000} random predecessor searches as the timed workload.
+    This \textbf{isolates search throughput} from modification cost,
+    making it the purest measure of in-leaf search efficiency and memory
+    layout quality.  The workload is most sensitive to:
+    \begin{enumerate}[nosep]
+      \item \emph{In-leaf search cost}: SIMD width (SSE2 at 4 keys vs.\
+            AVX2 at 8 keys per comparison), number of CL levels traversed,
+            and branch misprediction rate.
+      \item \emph{Memory layout}: cache-line utilisation (how many useful
+            keys per 64\,B line fetched) and whether the post-churn layout
+            retains spatial locality.
+      \item \emph{Tree height}: fewer outer-tree levels means fewer
+            pointer-chase misses before reaching the leaf.
+    \end{enumerate}
+    \textbf{ART caveat:} ART lacks native predecessor search; its wrapper
+    falls back to point lookup (\texttt{art\_search}), which is a
+    fundamentally different and easier operation.  ART's numbers in this
+    workload are not directly comparable to the other structures.
 \end{description}
 
+\paragraph{Key encoding.}
 All workloads use 4-byte \texttt{int32\_t} keys encoded as odd values
-($2i{+}1$), generated by xorshift64 with fixed seeds for reproducibility.
+($2i{+}1$), ensuring no key equals zero (used as a sentinel in CL sub-node
+headers).  Keys are generated by xorshift64 with fixed seeds for
+reproducibility across runs and platforms.
 
 \subsection{Matryoshka: Nested Sub-Tree Tradeoffs}
 
