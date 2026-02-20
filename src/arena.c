@@ -52,6 +52,10 @@ static mt_arena_t *arena_create(size_t arena_size, size_t page_size)
             return NULL;
         }
         arena->is_mmap = false;
+#ifdef __linux__
+        /* Hint the kernel to back this with transparent huge pages. */
+        madvise(base, arena_size, MADV_HUGEPAGE);
+#endif
     }
 #ifdef __linux__
     else {
