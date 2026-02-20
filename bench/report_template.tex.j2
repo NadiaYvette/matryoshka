@@ -1408,6 +1408,249 @@ Key observations:
     CPU from filling the pipeline efficiently.
 \end{description}
 
+\subsection{Bottleneck Analysis at $N{=}16\text{M}$ (Fence + Mass Prefetch)}
+\label{sec:bottleneck_16m}
+
+At $N{=}16\text{M}$ with \texttt{rand\_insert}, the fence + mass
+prefetch variant achieves 776\,ns/op (1.29\,Mop/s) with the following
+per-operation budget:
+
+\begin{table}[H]
+\centering
+\caption{Per-operation budget (\texttt{rand\_insert}, $N{=}16\text{M}$,
+  P-core at $\sim$1.4\,GHz effective).}
+\label{tab:op_budget}
+\begin{tabular}{lS[table-format=3.0]S[table-format=2.1]r}
+\toprule
+\textbf{Function} & {\textbf{Cycles/op}} & {\textbf{\% cycles}}
+  & \textbf{Role} \\
+\midrule
+\texttt{page\_find\_leaf}   & 412 & 37.3 & Fence search + mass prefetch + CL sub-tree descent \\
+\texttt{mt\_page\_insert}   & 280 & 25.3 & CL leaf binary search + insert + split propagation \\
+\texttt{mt\_inode\_search}  & 240 & 21.7 & Outer tree binary search (339-key inodes) \\
+\texttt{matryoshka\_insert} & 75  & 6.8  & \texttt{find\_leaf} dispatch + pointer retag \\
+Other                        & 99  & 8.9  & \texttt{memmove}, setup, shuffled-key generation \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Cache-miss attribution (\texttt{rand\_insert}, $N{=}16\text{M}$, P-core).}
+\label{tab:cachemiss_16m}
+\begin{tabular}{lrl}
+\toprule
+\textbf{Function} & \textbf{\% misses} & \textbf{Dominant instruction} \\
+\midrule
+\texttt{page\_find\_leaf}  & 44.1\% & \texttt{sub\_height} load --- page header first touch \\
+\texttt{mt\_page\_insert}  & 34.9\% & \texttt{cl->nkeys} load --- CL leaf first touch \\
+\texttt{mt\_inode\_search} & 13.5\% & Binary search \texttt{cmp} + prefetch loads in loop \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Bottleneck 1: Page Header Cold Miss (44\% of cache misses)}
+
+The first touch of each 4\,KiB leaf page (\texttt{sub\_height} at
+byte offset 5) accounts for 44\% of all cache misses.  At $N{=}16\text{M}$,
+the working set is $\sim$78K pages $\times$ 4\,KiB $= \sim$312\,MiB of
+leaf data --- far exceeding the 24\,MB L3 cache.  Only $\sim$6K of the
+78K pages fit in L3 at any time, yielding a $\sim$92\% miss rate on
+random page access.
+
+The pointer-tag prefetch in \texttt{find\_leaf} fires the page header
+prefetch at the last outer-tree level, but only $\sim$30 cycles of
+inode search computation separate the prefetch from the first access
+in \texttt{page\_find\_leaf} --- insufficient to hide an LLC miss
+($\sim$40--70 cycles) or DRAM miss ($\sim$200 cycles).
+
+\subsubsection{Bottleneck 2: CL Leaf Cold Miss (35\% of cache misses)}
+
+After fence keys resolve the target CL leaf slot, the mass prefetch
+fires all fence children before the fence search.  The fence search
+provides $\sim$12--18 cycles of latency window (6 comparisons).  At
+$N{=}16\text{M}$, the CL leaf's cache line has been evicted since the
+last visit to this page, and $\sim$18 cycles is insufficient to hide
+the LLC/DRAM latency.  The prefetch converts a \emph{stall} into a
+\emph{partial overlap}, but the residual miss remains the dominant
+bottleneck within \texttt{mt\_page\_insert} (74.4\% of its cache misses
+at the \texttt{cl->nkeys} load).
+
+\subsubsection{Bottleneck 3: Outer Inode Binary Search (13.5\% of cache misses, 21.7\% of cycles)}
+
+\texttt{mt\_inode\_search} binary-searches 339-key outer internal nodes
+(4\,KiB each, spanning 64 cache lines).  The binary search touches
+$\lceil\log_2 339\rceil \approx 9$ cache lines per search, with the
+prefetch-both-halves technique overlapping adjacent iterations.  The
+prefetch instructions themselves show 0\% cache misses (they never
+stall), but the \emph{data loads} after the prefetch still miss when
+the prefetch hasn't completed in time.  The cache misses are spread
+across the loop body: \texttt{cmp} instruction at 5.3\%, \texttt{movslq}
+at 12.9\%, and prefetch targets at 7.6\%.
+
+At $N{=}16\text{M}$ the outer tree has height~1 (root inode with
+$\sim$230 children).  The root inode's 4\,KiB page spans 64 cache lines;
+repeated accesses keep the hot lines in L2, but the binary search's
+access pattern touches $\sim$9 lines per query across different
+regions of the node.  Branch misprediction contributes 9.3\% of all
+branches missed ($\sim$11 mispredicts per insert), with $\sim$4 coming
+from the outer inode binary search (data-dependent \texttt{cmp/jle}
+at $\sim$50\% taken probability).
+
+\subsubsection{Hardware Counters at $N{=}16\text{M}$}
+
+\begin{table}[H]
+\centering
+\caption{Hardware counters: fence + mass prefetch
+  (\texttt{rand\_insert}, $N{=}16\text{M}$, P-core).}
+\label{tab:hw_16m}
+\begin{tabular}{lr}
+\toprule
+\textbf{Counter} & \textbf{Value} \\
+\midrule
+Cycles           & \num{18551518503} \\
+Instructions     & \num{12968103304} \\
+IPC              & 0.70 \\
+Cache references & \num{691719328}   \\
+Cache misses     & \num{482020663} (69.7\%) \\
+L1d load misses  & \num{134692327}   \\
+LLC load misses  & \num{18685337}    \\
+dTLB load misses & \num{8565404}     \\
+Branch misses    & \num{185437635} (9.3\% of \num{1998387729}) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Per-operation: $\sim$1106 cycles, $\sim$773 instructions, $\sim$8.0
+L1d misses, $\sim$1.1 LLC misses, $\sim$0.5 dTLB misses, $\sim$11
+branch mispredicts.  The 0.70 IPC indicates that $\sim$30\% of
+potential throughput is lost to cache and branch stalls.
+
+\subsection{Potential Throughput Improvements}
+\label{sec:future_improvements}
+
+\subsubsection{A. Enable Superpages (Already Implemented)}
+
+With 2\,MiB superpages (up to 510 pages per superpage), the 78K leaf
+pages at $N{=}16\text{M}$ fit in $\sim$153 superpages.  The outer tree
+shrinks from 78K children (height~1 with a 4\,KiB root inode) to 153
+children (root inode fits in a few hundred bytes, entirely in L1).
+Page-level internal nodes within each superpage are co-located in the
+same 2\,MiB region, improving TLB and spatial locality.
+
+The superpage infrastructure is already implemented
+(\texttt{mt\_hierarchy\_init\_superpage}); enabling it for the fence
+variant is a configuration change.
+
+\paragraph{Expected improvement:} 15--25\% at $N > 4\text{M}$
+(eliminates most outer-tree overhead, reduces TLB misses).
+
+\subsubsection{B. Batched Prefetch Pipelining}
+
+For bulk workloads, sort incoming keys and group by target leaf.
+While inserting key[$i$] into its CL leaf, prefetch the page header
+for key[$i{+}1$]'s target leaf.  This completely hides the 44\%
+page-header miss by overlapping it with the previous key's CL leaf
+insert ($\sim$280 cycles of useful work --- more than enough to hide
+even a DRAM miss).
+
+The batch insert API already exists (\texttt{matryoshka\_insert\_batch})
+but does not currently pipeline prefetches across keys.
+
+\paragraph{Expected improvement:} 20--30\% for batch workloads
+(eliminates the dominant page-header cold miss entirely).
+
+\subsubsection{C. Branchless Binary Search in Outer Inodes}
+
+Replace the data-dependent \texttt{cmp/jle} branches in
+\texttt{mt\_inode\_search}'s binary search loop with CMOV-based
+branchless updates:
+\begin{lstlisting}[language=C, xleftmargin=2em]
+while (lo < hi) {
+    int mid = lo + (hi - lo) / 2;
+    int go_right = (keys[mid] <= key);
+    lo = go_right ? mid + 1 : lo;   /* CMOV */
+    hi = go_right ? hi : mid;       /* CMOV */
+}
+\end{lstlisting}
+This eliminates $\sim$4 branch mispredicts per insert $\times$
+$\sim$15 cycle penalty $= \sim$60 cycles saved per operation.  The
+CMOV version is also more amenable to the CPU's load speculation since
+there are no mispredicted branches to flush.
+
+\paragraph{Expected improvement:} 5--8\%
+(reduces branch misprediction from 9.3\% to $\sim$6\%).
+
+\subsubsection{D. FAST-Layout Outer Inodes}
+
+The FAST paper~\cite{ref:fast} describes a cache-line-blocked layout
+for internal nodes that reorganises keys so each binary search step
+lands on a different cache line, with the tree structure matching the
+cache hierarchy.  Applied to the 339-key outer inodes:
+
+\begin{itemize}[nosep]
+  \item Level~0 (root line): 1 key, splits the node in half
+  \item Level~1: 2 keys, one per half
+  \item \ldots until cache-line-sized blocks of $\sim$15 keys
+\end{itemize}
+
+Each level's cache line can be prefetched one level ahead.  The
+current sorted-order layout requires $\sim$9 random cache line
+accesses within the 4\,KiB inode; the FAST layout converts this to a
+BFS descent where each level is a single cache line, enabling
+systematic prefetching.
+
+\paragraph{Expected improvement:} 10--15\%
+(reduces outer inode search from $\sim$240 to $\sim$150 cycles by
+eliminating $\sim$2 serial cache line misses).
+
+\subsubsection{E. Compile-Time Strategy Specialisation}
+
+The fence key fast path currently checks
+\texttt{hier->cl\_strategy == MT\_CL\_STRAT\_FENCE} at runtime on
+every insert.  Compile-time specialisation (via \texttt{\_\_attribute\_\_((flatten))}
+or template instantiation) would:
+\begin{itemize}[nosep]
+  \item Eliminate runtime strategy branches ($\sim$2--3 per insert)
+  \item Allow the compiler to inline \texttt{page\_find\_leaf} into
+        \texttt{mt\_page\_insert}, fusing the CL leaf resolution with
+        the insert
+  \item Reduce function call overhead ($\sim$20 cycles for
+        \texttt{callq}/\texttt{retq} + register save/restore)
+\end{itemize}
+
+\paragraph{Expected improvement:} 3--5\%
+(reduces instruction count and eliminates function call overhead).
+
+\subsubsection{Summary}
+
+\begin{table}[H]
+\centering
+\caption{Potential throughput improvements for
+  \texttt{rand\_insert} at $N{=}16\text{M}$.}
+\label{tab:future_improvements}
+\begin{tabular}{llrl}
+\toprule
+\textbf{Approach} & \textbf{Bottleneck addressed}
+  & \textbf{Est.\ gain} & \textbf{Effort} \\
+\midrule
+Superpages (config change) & Outer tree height + TLB & 15--25\% & Low \\
+Batched prefetch pipelining & Page header cold miss (44\%) & 20--30\% & Medium \\
+Branchless inode binary search & Branch misprediction (9.3\%) & 5--8\% & Small \\
+FAST-layout outer inodes & Inode search cache misses & 10--15\% & Large \\
+Compile-time specialisation & Runtime dispatch overhead & 3--5\% & Medium \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Approaches A--C are independent and composable; their improvements
+should be roughly additive.  Approach D (FAST layout) is orthogonal
+to A--C but requires significant restructuring of the outer inode
+format.  The combined ceiling from A+B+C is $\sim$40--60\%
+improvement for batch workloads, potentially bringing matryoshka to
+$\sim$500\,ns/op at $N{=}16\text{M}$ --- competitive with libart's
+384\,ns/op.
+
 \subsection{Future: Variable-Length Keys}
 
 The current 4-byte \texttt{int32\_t} key format could be extended to
