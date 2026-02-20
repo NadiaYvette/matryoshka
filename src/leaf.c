@@ -75,28 +75,61 @@ static int cl_leaf_predecessor(const mt_cl_leaf_t *cl, int32_t key)
     int n = cl->nkeys;
     if (n == 0) return -1;
 
-    /* SIMD scan: compare 4 keys at a time. */
+#if defined(__AVX512F__)
+    /* AVX-512: single masked 16-lane compare covers all 15 keys. */
+    __mmask16 valid = (__mmask16)((1u << n) - 1);
+    __m512i vkey = _mm512_set1_epi32(key);
+    __m512i vtree = _mm512_loadu_si512((const void *)cl->keys);
+    __mmask16 gt = _mm512_mask_cmpgt_epi32_mask(valid, vtree, vkey);
+    if (gt != 0)
+        return __builtin_ctz(gt) - 1;
+    return n - 1;
+
+#elif defined(__AVX2__)
+    /* AVX2: one 8-key load + scalar tail for remaining 7. */
+    __m256i vkey256 = _mm256_set1_epi32(key);
+    int result = -1;
+
+    if (n > 0) {
+        __m256i vtree = _mm256_loadu_si256((const __m256i *)cl->keys);
+        __m256i vcmp = _mm256_cmpgt_epi32(vtree, vkey256);
+        int mask = _mm256_movemask_ps(_mm256_castsi256_ps(vcmp));
+        int count = (n < 8) ? n : 8;
+        mask &= (1 << count) - 1;
+        if (mask != 0)
+            return __builtin_ctz(mask) - 1;
+        result = count - 1;
+    }
+    for (int i = 8; i < n; i++) {
+        if (cl->keys[i] > key)
+            return i - 1;
+        result = i;
+    }
+    return result;
+
+#else
+    /* SSE2: compare 4 keys at a time. */
     __m128i vkey = _mm_set1_epi32(key);
     int result = -1;
 
     int i = 0;
     for (; i + 3 < n; i += 4) {
         __m128i vtree = _mm_loadu_si128((const __m128i *)(cl->keys + i));
-        __m128i vcmp = _mm_cmpgt_epi32(vtree, vkey); /* tree[j] > key */
+        __m128i vcmp = _mm_cmpgt_epi32(vtree, vkey);
         int mask = _mm_movemask_ps(_mm_castsi128_ps(vcmp));
         if (mask != 0) {
             int first_gt = i + __builtin_ctz(mask);
-            return first_gt - 1;  /* predecessor is one before first > key */
+            return first_gt - 1;
         }
-        result = i + 3;  /* all 4 are <= key */
+        result = i + 3;
     }
-    /* Scalar tail. */
     for (; i < n; i++) {
         if (cl->keys[i] > key)
             return i - 1;
         result = i;
     }
     return result;
+#endif
 }
 
 /* Insert key into CL leaf.  Returns 0 on success, -1 if duplicate,
@@ -166,7 +199,41 @@ static int cl_inode_search(const mt_cl_inode_t *cl, int32_t key)
     int n = cl->nkeys;
     if (n == 0) return 0;
 
-    /* SIMD scan for small n (always ≤ 12). */
+#if defined(__AVX512F__)
+    /* AVX-512: single masked compare for all 12 keys. */
+    __mmask16 valid = (__mmask16)((1u << n) - 1);
+    __m512i vkey = _mm512_set1_epi32(key);
+    __m512i vtree = _mm512_loadu_si512((const void *)cl->keys);
+    __mmask16 gt = _mm512_mask_cmpgt_epi32_mask(valid, vtree, vkey);
+    if (gt != 0)
+        return __builtin_ctz(gt);
+    return n;
+
+#elif defined(__AVX2__)
+    /* AVX2: one 8-key load + SSE2 tail for remaining 4. */
+    {
+        __m256i vkey256 = _mm256_set1_epi32(key);
+        __m256i vtree = _mm256_loadu_si256((const __m256i *)cl->keys);
+        __m256i vcmp = _mm256_cmpgt_epi32(vtree, vkey256);
+        int mask = _mm256_movemask_ps(_mm256_castsi256_ps(vcmp));
+        int count = (n < 8) ? n : 8;
+        mask &= (1 << count) - 1;
+        if (mask != 0)
+            return __builtin_ctz(mask);
+    }
+    if (n > 8) {
+        __m128i vkey128 = _mm_set1_epi32(key);
+        __m128i vtree = _mm_loadu_si128((const __m128i *)(cl->keys + 8));
+        __m128i vcmp = _mm_cmpgt_epi32(vtree, vkey128);
+        int mask = _mm_movemask_ps(_mm_castsi128_ps(vcmp));
+        mask &= (1 << (n - 8)) - 1;
+        if (mask != 0)
+            return 8 + __builtin_ctz(mask);
+    }
+    return n;
+
+#else
+    /* SSE2: scan 4 keys at a time. */
     __m128i vkey = _mm_set1_epi32(key);
     int i = 0;
     for (; i + 3 < n; i += 4) {
@@ -181,6 +248,7 @@ static int cl_inode_search(const mt_cl_inode_t *cl, int32_t key)
             return i;
     }
     return n;
+#endif
 }
 
 /* Insert a separator key and right child into a CL internal node at `pos`.
@@ -255,6 +323,10 @@ static int page_find_leaf(const mt_lnode_t *page, int32_t key,
     int height = page->header.sub_height;
     *path_len = 0;
 
+    /* Prefetch the root CL node — it's on a different cache line than
+       the page header we just read (root_slot). */
+    __builtin_prefetch(get_slot_c(page, slot), 0, 1);
+
     for (int i = 0; i < height; i++) {
         const mt_cl_slot_t *s = get_slot_c(page, slot);
         int ci = cl_inode_search(&s->inode, key);
@@ -262,6 +334,9 @@ static int page_find_leaf(const mt_lnode_t *page, int32_t key,
         path[*path_len].child_idx = (uint8_t)ci;
         (*path_len)++;
         slot = s->inode.children[ci];
+        /* Prefetch the child CL node's cache line so the next
+           iteration (or the caller) finds it warm in L2. */
+        __builtin_prefetch(get_slot_c(page, slot), 0, 1);
     }
 
     return slot;
@@ -679,6 +754,7 @@ static int extract_subtree(const mt_lnode_t *page, int slot,
                             int32_t *out, int pos)
 {
     const mt_cl_slot_t *s = get_slot_c(page, slot);
+    __builtin_prefetch(s, 0, 0);
 
     if (s->type == MT_CL_LEAF) {
         memcpy(out + pos, s->leaf.keys,
@@ -841,6 +917,7 @@ int32_t mt_page_min_key(const mt_lnode_t *page)
     const mt_cl_slot_t *s = get_slot_c(page, slot);
     while (s->type == MT_CL_INTERNAL) {
         slot = s->inode.children[0];
+        __builtin_prefetch(get_slot_c(page, slot), 0, 1);
         s = get_slot_c(page, slot);
     }
     return (s->leaf.nkeys > 0) ? s->leaf.keys[0] : MT_KEY_MAX;

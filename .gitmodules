@@ -1,0 +1,9 @@
+[submodule "bench/vendor/libart"]
+	path = bench/vendor/libart
+	url = https://github.com/armon/libart.git
+[submodule "bench/vendor/tlx"]
+	path = bench/vendor/tlx
+	url = https://github.com/tlx/tlx.git
+[submodule "bench/vendor/abseil-cpp"]
+	path = bench/vendor/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp.git

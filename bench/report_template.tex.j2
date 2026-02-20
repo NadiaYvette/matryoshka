@@ -259,7 +259,6 @@ isolating search performance from modification cost.
          branch misprediction rate.}
 \label{fig:perf_counters}
 \end{figure}
-\BLOCK{endif}
 
 \subsection{dTLB Miss Rate}
 Matryoshka's arena allocator places leaf nodes in contiguous 2\,MiB
@@ -288,10 +287,17 @@ SIMD mask arithmetic replaces conditional branches during search,
 yielding near-zero misprediction.  Modification operations navigate the
 CL sub-tree using the same SIMD search, with only the final CL leaf
 insert/delete using scalar \texttt{memmove} on $\le 14$ keys.
+\BLOCK{else}
+Hardware counter data was not collected for this run.  Re-run with
+\texttt{perf} support enabled (omit \texttt{-{}-no-perf}) to populate
+this section with dTLB miss rates, LLC miss rates, IPC, and branch
+misprediction data.
+\BLOCK{endif}
 
 %% ═══════════════════════════════════ Profiling ═════════════════════════════
 \section{Profiling: Hot Functions}
 
+\BLOCK{if profile_functions}
 \begin{table}[H]
 \centering
 \caption{Top functions (\texttt{perf record}, rand\_insert, $N{=}\num{1048576}$).}
@@ -312,6 +318,141 @@ The hot functions are the page-level sub-tree operations:
 sub-tree via SIMD search, then perform a scalar insert or delete within
 a single 64\,B cache-line sub-node.  CL sub-node splits and merges
 occur only on overflow or underflow.
+\BLOCK{else}
+Profiling data was not collected for this run.  Re-run with
+\texttt{perf} support enabled (omit \texttt{-{}-no-perf}) to populate
+this section.
+\BLOCK{endif}
+
+%% ═══════════════════════════════════ Cache-Miss Attribution ═══════════════
+\section{Cache-Miss Attribution Analysis}
+
+\BLOCK{if cache_miss_functions}
+This section attributes cache misses to individual functions using
+\texttt{perf record -e cache-misses}.  The data reveals \emph{where}
+in the code the processor stalls waiting for memory, complementing
+the aggregate hardware counters in Section~7.
+
+\begin{table}[H]
+\centering
+\caption{Top functions by cache-miss contribution
+  (matryoshka, rand\_insert, $N{=}\num{4194304}$).}
+\label{tab:cache_miss_attr}
+\begin{tabular}{rll}
+\toprule
+\textbf{\% Cache Misses} & \textbf{Function} \\
+\midrule
+\BLOCK{for fn in cache_miss_functions}
+\num{\VAR{fn.pct}}\% & \texttt{\VAR{fn.name}} \\
+\BLOCK{endfor}
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Root Cause: CL Sub-Node Cache-Line Jumps}
+
+The dominant cache-miss source is the CL sub-tree navigation within
+each 4\,KiB page leaf.  When \texttt{page\_find\_leaf} descends the
+CL sub-tree, each level accesses a different 64\,B slot within the
+page.  These slots are not adjacent --- slot indices are assigned by
+a bitmap allocator, so the root CL inode, its child CL inode, and
+the target CL leaf typically reside on non-contiguous cache lines.
+
+The hardware prefetcher cannot predict these indirect jumps (each
+CL internal node stores child slot indices that must be read before
+the next cache line address is known).  This creates a dependent
+chain of cache misses: \emph{read child index $\rightarrow$ compute
+address $\rightarrow$ miss on that address $\rightarrow$ repeat}.
+
+At $N{=}4\text{M}$ with random inserts, the 4\,KiB pages are spread
+across a $\sim$20\,MiB working set, exceeding L2 but fitting in L3.
+Each page access brings the header cache line into L1, but the
+CL sub-nodes deeper in the page have been evicted since the last
+visit to that page.
+
+\subsection{Optimisation: Software Prefetching}
+
+Software prefetch hints (\texttt{\_\_builtin\_prefetch}) have been
+added at three levels:
+
+\begin{description}[style=nextline, nosep, leftmargin=1em]
+  \item[\texttt{page\_find\_leaf} (CL sub-tree descent)]
+    After reading the page header's \texttt{root\_slot}, the root
+    CL node's cache line is prefetched before the loop begins.
+    Within each loop iteration, after determining the child slot
+    index from \texttt{cl\_inode\_search}, the child's cache line
+    is prefetched before the next iteration accesses it.  This
+    converts the dependent miss chain into overlapped prefetch +
+    computation.
+
+  \item[\texttt{find\_leaf} (outer B+ tree descent)]
+    After \texttt{mt\_inode\_search} determines the child pointer,
+    the first cache line of the child node is prefetched.  For
+    internal-to-internal transitions, this warms the next inode's
+    header and first keys.  For the last level (internal-to-leaf),
+    this warms the page header so that \texttt{page\_find\_leaf}
+    starts with the header in L2.
+
+  \item[\texttt{mt\_inode\_search} (binary search in outer inodes)]
+    For nodes exceeding the SIMD linear scan threshold, the binary
+    search prefetches the midpoints of both candidate halves before
+    each comparison.  This converts the $O(\log N)$ dependent miss
+    chain of binary search into a pipelined prefetch sequence.
+\end{description}
+
+All prefetches use \texttt{locality=1} (L2 hint), appropriate for
+data that will be used once in the near future but is unlikely to
+be reused before eviction.
+
+\subsection{Optimisation: Pointer Tagging for CL Root Prefetch}
+
+Instruction-level profiling revealed that the initial software prefetching
+approach had insufficient lead time: the CL root prefetch inside
+\texttt{page\_find\_leaf} was issued \emph{after} loading the page header
+(to read \texttt{root\_slot}), leaving only $\sim$5\,ns of computation
+before the CL root access---far less than the $\sim$100\,ns needed for
+an L3 miss to resolve.
+
+To address this, leaf metadata is embedded in the low bits of child pointers
+in the outer B+ tree's internal nodes.  All node pointers are 4096-byte
+aligned, providing 12 guaranteed-zero low bits.  The encoding is:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Bits} & \textbf{Field} & \textbf{Range} \\
+\midrule
+0--5  & \texttt{root\_slot}  & 1--63 (CL sub-tree root slot index) \\
+6--8  & \texttt{sub\_height} & 0--7  (CL sub-tree height) \\
+9--11 & \textit{reserved}    & (available for future use, e.g.\ fullness counts) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+With this scheme, \texttt{find\_leaf} can extract \texttt{root\_slot} from
+the tagged child pointer \emph{without} reading the page header, enabling
+it to issue \emph{two} prefetches simultaneously at the last outer-tree
+level:
+
+\begin{enumerate}[nosep]
+  \item The page header cache line (slot 0), as before;
+  \item The CL root cache line (\texttt{slots[root\_slot $-$ 1]}),
+        computed from the tag.
+\end{enumerate}
+
+Both prefetches issue at the same time, overlapping with whatever inode
+search computation follows.  Tags are maintained at leaf creation
+(bulk-load, split) and updated after each insert or delete that may
+change \texttt{root\_slot} or \texttt{sub\_height}.  Every child pointer
+read goes through an \texttt{mt\_untag()} mask operation (a single AND
+instruction) to strip the low 12 bits before dereferencing.  Stale tags
+on cold paths (rebalance) merely cause a wasted prefetch---never a
+correctness issue.
+\BLOCK{else}
+Cache-miss attribution data was not collected for this run.  Re-run
+with \texttt{perf} support enabled to populate this section with
+per-function cache-miss breakdowns.
+\BLOCK{endif}
 
 %% ═══════════════════════════════════ Results Table ═════════════════════════
 \section{Detailed Results Table}
@@ -349,110 +490,452 @@ Matryoshka rows highlighted in \colorbox{rowhl}{blue}.
 %% ═══════════════════════════════════ Analysis ══════════════════════════════
 \section{Analysis and Diagnosis}
 
-\subsection{Nested Sub-Tree Modification Cost}
+\subsection{Benchmark Access Patterns}
+
+The seven workloads exercise distinct access patterns that interact
+differently with each data structure's memory layout:
+
+\begin{description}[style=nextline, nosep, leftmargin=1em]
+  \item[\texttt{seq\_insert}]
+    Keys arrive in ascending order (1, 3, 5, \ldots).  Structures with
+    append-optimised paths benefit: B-trees fill leaves left-to-right
+    with no splits until full; red-black trees rebalance but maintain
+    temporal locality in the allocator.  ART builds monotonically deeper
+    paths in byte-order.  Matryoshka benefits from sequential CL sub-node
+    filling within each page, but the nested sub-tree overhead (navigating
+    CL internals) makes each insert more expensive than a simple sorted-array
+    append.
+
+  \item[\texttt{rand\_insert}]
+    A Fisher--Yates shuffle of $[0, N)$ scaled to odd values.  Every
+    insert touches a random leaf, maximising cache pressure.  This is the
+    workload most sensitive to node size and memory layout: wide B-tree
+    leaves amortise random access; pointer-chasing structures
+    (\texttt{std::set}) incur a cache miss per tree level; ART's
+    fixed-depth (4-byte key $\Rightarrow$ $\le 4$ levels) limits misses.
+
+  \item[\texttt{rand\_delete}]
+    Bulk-loads $N$ sorted keys, then deletes all in shuffled order.
+    The bulk-load gives every structure its optimal starting layout.
+    Random deletion stresses rebalancing: red-black trees do O(1)
+    rotations; B-trees \texttt{memmove} within leaves and occasionally
+    merge or redistribute; matryoshka merges CL sub-nodes within a page,
+    with page-level merges only on underflow.
+
+  \item[\texttt{mixed}]
+    Alternating insert (new key beyond current max) and delete (random
+    existing key) on a pre-loaded tree.  This creates a steady-state
+    workload where the tree size fluctuates around $N$.  Structures
+    that handle interleaved modifications without excessive rebalancing
+    perform well.
+
+  \item[\texttt{ycsb\_a} (95\% insert / 5\% search)]
+    Simulates a write-dominated OLTP workload.  Inserts are sequential
+    (monotonically increasing keys), so append-path efficiency matters.
+    The 5\% predecessor searches touch recently-inserted regions, favouring
+    structures with good temporal locality in their leaf layer.
+
+  \item[\texttt{ycsb\_b} (50\% delete / 50\% search)]
+    Deletes from a pre-loaded tree interleaved with random predecessor
+    searches.  The shrinking tree tests whether structures maintain
+    search efficiency as occupancy drops and structural changes
+    (merges, rebalancing) occur.
+
+  \item[\texttt{search\_after\_churn}]
+    Pure search workload on a tree that has undergone insert/delete churn
+    (untimed).  \num{5000000} random predecessor searches isolate search
+    throughput from modification cost.  This workload is most sensitive
+    to in-leaf search cost and memory layout, not structural operations.
+    Note: ART lacks native predecessor search; its wrapper falls back to
+    point lookup, giving it an advantage on hit rate but testing a
+    different operation.
+\end{description}
+
+All workloads use 4-byte \texttt{int32\_t} keys encoded as odd values
+($2i{+}1$), generated by xorshift64 with fixed seeds for reproducibility.
+
+\subsection{Matryoshka: Nested Sub-Tree Tradeoffs}
 
 Each insert or delete navigates the page-level CL sub-tree (2--3 SIMD
 comparisons on 12--15 keys per level) to a target CL leaf, then performs
 a scalar \texttt{memmove} of at most 14 keys within that 64\,B
 cache-line sub-node.  The cost per modification is
 $O(h_s \times b)$ where $h_s \le 2$ is the sub-tree height and
-$b = 15$ is the CL leaf capacity --- roughly 30--45 key touches.
+$b = 15$ is the CL leaf capacity---roughly 30--45 key touches, all
+within a single 4\,KiB page.
 
-CL sub-node splits and merges occur only when a CL leaf overflows (15
-keys) or underflows ($< 7$ keys).  Page-level splits (extracting all
-keys and dividing across two pages) occur only when all 63 CL slots are
-exhausted.  These are standard B+ tree structural operations, not
-full-page rebuilds.
+CL sub-node splits and merges occur only when a CL leaf overflows
+(15 keys) or underflows ($< 7$ keys).  Page-level splits occur only
+when all 63 CL slots are exhausted ($\sim$855 keys/page).
 
-Matryoshka achieves \VAR{matryoshka_rand_insert_mops} Mop/s on random
-insert ($N{=}\num{1048576}$), vs.\ \VAR{stdset_rand_insert_mops} Mop/s
-(\texttt{std::set}) and \VAR{best_competitor_rand_insert_mops} Mop/s
-(fastest B-tree competitor).
+The nested design adds a constant overhead per operation compared to
+flat sorted-array B-tree leaves, where a single \texttt{memmove}
+suffices.  At $N{=}\num{1048576}$: matryoshka achieves
+\VAR{mat_rand_insert_mops} Mop/s on random insert, vs.\
+\VAR{abseil_rand_insert_mops} (Abseil) and
+\VAR{tlx_rand_insert_mops} (TLX).
 
-\subsection{SIMD at Every Level}
+However, SIMD search through the CL sub-tree is used during both
+search \emph{and} the navigation phase of insert/delete.  This yields
+search-after-churn throughput of \VAR{mat_search_after_churn_mops}
+Mop/s at $N{=}\num{1048576}$.  The key advantage is that modifications
+touch a single cache-line sub-node rather than shifting an entire
+sorted leaf array.
 
-SIMD \texttt{\_mm\_cmpgt\_epi32}/\texttt{\_mm\_movemask\_ps} is used
-for search within CL leaves (15 keys), CL internal nodes (12 separator
-keys), and outer internal nodes ($\le 339$ keys).  Unlike a flat
-SIMD-blocked layout, the nested design retains SIMD benefits for both
-search \emph{and} the navigation phase of insert/delete.
+\subsection{Detailed Comparison: std::set (Red-Black Tree)}
 
-Search-after-churn throughput is \VAR{matryoshka_search_mops} Mop/s at
-$N{=}\num{1048576}$.
+\texttt{std::set} uses a balanced binary search tree with one
+heap-allocated node per key (40--48\,B on 64-bit systems: two child
+pointers, parent pointer, colour bit, key, allocator overhead).
 
-\subsection{Arena Allocator and TLB Effects}
+\paragraph{Insert and delete.}
+At $N{=}\num{\VAR{largest_n}}$: \VAR{stdset_rand_insert_mops_large}
+Mop/s (random insert) and \VAR{stdset_rand_delete_mops_large} Mop/s
+(random delete)---the slowest of all libraries tested.
+Each operation traverses $O(\log_2 N)$ levels with a pointer
+dereference (and likely cache miss) at every level.  The 40--48\,B node
+size means $\sim$1 useful key per cache line, so every level is a
+full cache miss for large $N$.
 
-The arena allocator places leaves in 2\,MiB hugepage-backed regions
-via \texttt{mmap(MAP\_HUGETLB)}, falling back to
-\texttt{posix\_memalign} + \texttt{madvise(MADV\_HUGEPAGE)}:
-\begin{itemize}[nosep]
-  \item \textbf{Reduced dTLB misses}: one 2\,MiB hugepage covers 512
-        leaf pages.  dTLB rate: \VAR{matryoshka_dtlb_miss_rate}/\num{1000}
-        ops vs.\ \VAR{stdset_dtlb_miss_rate} for \texttt{std::set}.
-  \item \textbf{Spatial locality}: co-located leaves benefit sequential
-        scans and range iteration.
-\end{itemize}
+\paragraph{Sequential insert.}
+At \VAR{stdset_seq_insert_mops_large} Mop/s
+($N{=}\num{\VAR{largest_n}}$), sequential insert is only modestly
+better than random because the allocator provides some temporal
+locality, but the red-black tree still requires $O(\log N)$ pointer
+chases and rotations.
 
-\subsection{Where std::set Falls Behind}
+\paragraph{Search.}
+Search-after-churn: \VAR{stdset_search_after_churn_mops_large} Mop/s.
+Binary search through $\log_2 N \approx 24$ levels of pointer chasing
+is inherently cache-unfriendly.  \texttt{std::set} has no mechanism
+for SIMD-accelerated search or cache-line-aware layout.
 
-\texttt{std::set} (red-black tree) suffers from pointer chasing (one
-cache miss per level), poor spatial locality, and high per-node overhead
-(40--48\,B/key vs.\ 4\,B in matryoshka).  Its $O(\log N)$ insert
-involves a constant-factor pointer update but pays a cache miss at
-every tree level.
+\paragraph{Scaling.}
+\texttt{std::set} shows the steepest throughput degradation from small
+to large $N$ (random insert scales
+\VAR{scale_stdset_rand_insert}$\times$ from $N{=}\num{\VAR{smallest_n}}$
+to $N{=}\num{\VAR{largest_n}}$) because the working set of
+pointer-chased nodes quickly exceeds cache capacity.
 
-\subsection{Where TLX and Abseil Compete}
+\subsection{Detailed Comparison: TLX btree\_set}
 
-Both use sorted-array B-tree leaves with \texttt{memmove} insert ($B
-\approx 64$--$256$).  They stay within \VAR{btree_insert_gap_pct}\% of
-each other.  Matryoshka is competitive on insert-heavy workloads thanks
-to the nested sub-tree design, though sorted-array leaves have a simpler
-constant factor for small \texttt{memmove} operations.  Neither TLX nor
-Abseil uses SIMD for in-leaf search.
+TLX implements a B+ tree with sorted-array leaves.  Leaf capacity is
+typically 64--128 keys (depends on template parameters and key size).
+Internal nodes use sorted arrays of separator keys with binary search.
 
-\subsection{ART's Radix Approach}
+\paragraph{Insert and delete.}
+At $N{=}\num{\VAR{largest_n}}$: \VAR{tlx_rand_insert_mops_large} Mop/s
+(random insert) and \VAR{tlx_rand_delete_mops_large} Mop/s (random
+delete).  Each leaf insert is a binary search followed by a
+\texttt{memmove} of the leaf's sorted array.  The average shift is
+$B/2 \approx 32$--64 keys per insert, but the entire operation stays
+within one or two cache lines for small leaves.
 
-ART performs $O(\text{key\_length})$ operations independent of $N$.  For
-4-byte keys it traverses $\le 4$ levels with compact node arrays (4--256
-entries).  Insert and delete are cache-efficient, but ART lacks native
-predecessor search, so \texttt{search\_after\_churn} uses point lookups.
+\paragraph{Search.}
+Search-after-churn: \VAR{tlx_search_after_churn_mops_large} Mop/s.
+TLX uses scalar binary search within leaves, which incurs
+$\lceil\log_2 B\rceil$ comparisons with data-dependent branches.
+This is slower than SIMD linear scan for the same leaf size.
+
+\paragraph{Sequential insert.}
+\VAR{tlx_seq_insert_mops_large} Mop/s.  The B+ tree append path is
+efficient: new keys land at the rightmost leaf with minimal shifting,
+and splits propagate only when the leaf is full.
+
+\paragraph{Comparison to matryoshka.}
+TLX's flat sorted-array leaves have a lower constant factor per
+insert (one \texttt{memmove} vs.\ CL sub-tree navigation), but
+matryoshka's wider pages (855 keys vs.\ $\sim$128) reduce the outer
+tree height and number of leaf splits.  At large $N$, the outer-tree
+traversal cost dominates, and matryoshka's SIMD-accelerated outer
+internal node search closes the gap.
+
+\subsection{Detailed Comparison: Abseil btree\_set}
+
+Abseil's B-tree uses a similar sorted-array design to TLX but with
+different node sizes and allocation strategies.  Leaf nodes hold up
+to $\sim$256 keys in a single sorted array.
+
+\paragraph{Insert and delete.}
+At $N{=}\num{\VAR{largest_n}}$: \VAR{abseil_rand_insert_mops_large}
+Mop/s (random insert) and \VAR{abseil_rand_delete_mops_large} Mop/s
+(random delete).  The wider leaves mean fewer tree levels and splits,
+but each \texttt{memmove} within a leaf shifts more keys on average
+($B/2 \approx 128$).
+
+\paragraph{Search.}
+Search-after-churn: \VAR{abseil_search_after_churn_mops_large} Mop/s.
+Abseil uses scalar binary search within leaves.  The wider leaves
+reduce tree height (fewer pointer chases) but increase the number of
+comparisons per leaf ($\lceil\log_2 256\rceil = 8$ vs.\ $\lceil\log_2
+128\rceil = 7$ for TLX).
+
+\paragraph{TLX vs.\ Abseil.}
+On random insert at $N{=}\num{\VAR{largest_n}}$, TLX and Abseil are
+within \VAR{btree_insert_gap_pct}\% of each other.  Abseil's wider
+leaves trade cheaper outer traversal (fewer levels) for more expensive
+in-leaf operations (larger \texttt{memmove}).  The two designs
+converge in throughput because the cache miss cost of locating the
+target leaf dominates at large $N$.
+
+\subsection{Detailed Comparison: libart (Adaptive Radix Tree)}
+
+ART uses a radix/trie structure with adaptive node types (Node4,
+Node16, Node48, Node256) that compact sparse levels.  For 4-byte keys,
+the tree has at most 4 levels regardless of $N$.
+
+\paragraph{Insert and delete.}
+At $N{=}\num{\VAR{largest_n}}$: \VAR{art_rand_insert_mops_large}
+Mop/s (random insert) and \VAR{art_rand_delete_mops_large} Mop/s
+(random delete).  ART's $O(k)$ complexity (key length, not tree size)
+means insert cost is nearly constant across dataset sizes.  The
+scaling ratio from $N{=}\num{\VAR{smallest_n}}$ to
+$N{=}\num{\VAR{largest_n}}$ is \VAR{scale_art_rand_insert}$\times$
+---the flattest of all structures tested.
+
+\paragraph{Search.}
+Search-after-churn: \VAR{art_search_after_churn_mops_large} Mop/s.
+ART achieves the highest absolute search throughput because its point
+lookups traverse $\le 4$ levels, each requiring a single indexed array
+access (no comparison-based search within nodes for Node256).
+\emph{However}, the benchmark uses point lookups for ART rather than
+predecessor search (which ART does not natively support), so this
+comparison is not apples-to-apples with the other structures.
+
+\paragraph{Access pattern interaction.}
+ART's per-byte radix decomposition means key distribution matters less
+than key length.  The uniform random keys in these benchmarks create
+well-distributed tries with few path-compressed nodes.  A workload
+with clustered keys sharing long common prefixes would trigger more
+path compression and potentially different performance
+characteristics.
+
+\paragraph{Memory overhead.}
+ART's adaptive node types (4, 16, 48, or 256 children) trade memory
+for access speed.  At high occupancy, most internal nodes are Node48
+or Node256, using 256--2048\,B per node regardless of actual
+fan-out---significantly more memory per key than B-tree or matryoshka
+designs.
+
+\subsection{Hardware Counter Comparison}
+
+\BLOCK{if hw_rows}
+\begin{table}[H]
+\centering
+\caption{Hardware counters across all libraries (rand\_insert, $N{=}\num{\VAR{largest_n}}$).}
+\label{tab:hw_compare}
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{Library} & \textbf{Cache Miss} & \textbf{L1d Miss}
+  & \textbf{LLC Miss} & \textbf{dTLB Miss} & \textbf{Branch Miss}
+  & \textbf{IPC} \\
+  & \textbf{(\%)} & \textbf{(\%)} & \textbf{(\%)}
+  & \textbf{(/1K ops)} & \textbf{(\%)} & \\
+\midrule
+\BLOCK{for row in hw_rows}
+\BLOCK{if row.name == 'matryoshka'}
+\rowcolor{rowhl}
+\BLOCK{endif}
+\texttt{\VAR{row.name}} & \VAR{row.cache_miss_pct}
+  & \VAR{row.l1d_miss_pct} & \VAR{row.llc_miss_pct}
+  & \VAR{row.dtlb_miss_per_1k} & \VAR{row.branch_miss_pct}
+  & \VAR{row.ipc} \\
+\BLOCK{endfor}
+\bottomrule
+\end{tabular}
+\end{table}
+
+The hardware counters reveal distinct micro-architectural profiles:
+
+\paragraph{dTLB pressure.}
+Matryoshka's arena allocator (2\,MiB hugepage-backed regions) yields
+the lowest dTLB miss rate (\VAR{matryoshka_dtlb_miss_rate}/\num{1000}
+ops).  \texttt{std::set} has the highest
+(\VAR{stdset_dtlb_miss_rate}/\num{1000}) because each pointer chase
+to a heap-allocated node potentially touches a new 4\,KiB page.
+The B-tree libraries (TLX, Abseil) fall between: their wider nodes
+reduce the number of distinct pages accessed per operation, but
+they use standard \texttt{malloc} without hugepage awareness.
+ART's adaptive nodes are heap-allocated but fewer in number than
+red-black tree nodes, yielding moderate dTLB pressure.
+
+\paragraph{LLC misses.}
+At $N{=}\num{\VAR{largest_n}}$ (random insert), all structures exceed
+LLC capacity.  Matryoshka's LLC miss rate is
+\VAR{matryoshka_llc_miss_rate}/\num{1000} ops vs.\
+\VAR{stdset_llc_miss_rate} for \texttt{std::set}.  Matryoshka
+confines each leaf operation to a single 4\,KiB page (or a few
+adjacent cache lines for CL sub-node navigation), while red-black
+tree operations touch $\log_2 N$ widely-scattered nodes.  The B-tree
+libraries achieve comparable LLC rates because their wide leaves
+also localise work.
+
+\paragraph{IPC.}
+Matryoshka achieves IPC of \VAR{matryoshka_ipc} via SIMD search
+(\texttt{\_mm\_cmpgt\_epi32}/\texttt{\_mm\_movemask\_ps}) at every
+level, avoiding data-dependent branches.  \texttt{std::set}'s
+pointer-chasing and branch-heavy traversal yields the lowest IPC.
+ART's indexed array lookups (no comparisons for Node256) can achieve
+high IPC on cache-hot paths.
+
+\paragraph{Branch misprediction.}
+SIMD mask arithmetic in matryoshka replaces conditional branches,
+yielding low branch misprediction rates.  \texttt{std::set} and the
+scalar-binary-search B-trees (TLX, Abseil) have higher
+misprediction rates because each comparison is a data-dependent
+branch.  ART's indexed-lookup approach avoids comparison branches
+within nodes but has conditional branches for node type dispatch.
+\BLOCK{else}
+Hardware counter data was not collected for this run.  Re-run with
+\texttt{perf} support enabled (omit \texttt{-{}-no-perf}) to populate
+this section.
+\BLOCK{endif}
+
+\subsection{Access Pattern Interactions with Data Structure Layout}
+
+The interaction between access pattern and memory layout explains
+much of the performance variation:
+
+\paragraph{Sequential vs.\ random insert.}
+Sequential insert favours structures with efficient append paths.
+All B-tree variants (matryoshka, TLX, Abseil) benefit because new
+keys land at the rightmost leaf.  \texttt{std::set} benefits less
+because red-black rebalancing is oblivious to key order.  The
+throughput ratio (seq/rand) at $N{=}\num{\VAR{largest_n}}$ reveals
+how much each structure benefits from locality:
+matryoshka \VAR{ratio_mat_stdset_seq_insert}$\times$ vs.\
+std::set on sequential, \VAR{ratio_mat_stdset_rand_insert}$\times$
+on random.
+
+\paragraph{Delete after bulk-load vs.\ interleaved.}
+The \texttt{rand\_delete} workload starts from a bulk-loaded
+(optimally packed) tree, giving every structure its best starting
+point.  The \texttt{mixed} workload, by contrast, operates on a
+tree that is continuously modified, creating internal fragmentation.
+Structures that maintain good occupancy under churn (B-trees with
+merge/redistribute) degrade less between these workloads than
+structures with per-node allocation (\texttt{std::set}).
+
+\paragraph{The 4\,KiB page boundary.}
+Matryoshka's 4\,KiB page leaves are sized to match the OS page size,
+ensuring that navigating the CL sub-tree within a leaf never crosses a
+page boundary.  TLX and Abseil leaves are smaller ($<$1\,KiB), so
+multiple leaves may share a page---good for spatial locality of
+adjacent leaves, but each leaf may straddle two cache lines for the
+\texttt{memmove} operation.  \texttt{std::set} nodes are scattered
+across the heap with no page-alignment guarantees.
+
+\paragraph{SIMD and branch prediction.}
+Matryoshka's SIMD search produces a bit mask rather than a conditional
+branch, making it prediction-friendly.  The sorted-array B-trees
+(TLX, Abseil) use scalar binary search with $O(\log B)$
+data-dependent branches per leaf, which the branch predictor
+struggles with for uniform random keys (50/50 taken probability
+at each comparison).
+
+\subsection{Proposed Additional Access Patterns}
+
+Several workloads not currently benchmarked would reveal different
+performance relationships:
+
+\begin{description}[style=nextline, nosep, leftmargin=1em]
+  \item[Zipfian (skewed) insert]
+    A Zipfian distribution concentrates inserts on a small number of
+    ``hot'' leaves.  B-tree variants would benefit from cache-hot leaves;
+    \texttt{std::set} would benefit from a cache-hot path of recently
+    accessed nodes.  Matryoshka's per-page CL sub-tree might show
+    more frequent CL splits under concentrated load.
+
+  \item[Range scan after insert]
+    Iterate over a range of $k$ keys (e.g.\ $k = 1000$) after building
+    the tree.  Matryoshka's linked leaf pages and dense packing should
+    excel; \texttt{std::set}'s in-order traversal via parent pointers
+    would lag.  This would highlight the spatial locality advantage of
+    contiguous leaf storage.
+
+  \item[Interleaved point lookup and insert]
+    A read-modify-write pattern (``contains then insert if absent'')
+    would test whether search and insert share cache-hot state.
+    Matryoshka's search and insert paths share the same CL sub-tree
+    navigation code, so a just-searched path remains cache-hot for
+    the subsequent insert.
+
+  \item[Large-key workload]
+    Keys longer than 4 bytes (e.g.\ 16- or 32-byte strings) would
+    stress ART's strength (key-length-dependent, not N-dependent
+    traversal) while increasing matryoshka's CL sub-node overhead
+    (fewer keys per 64\,B cache line).  B-tree \texttt{memmove}
+    cost would grow linearly with key size.
+
+  \item[Delete-heavy with searches (YCSB-D)]
+    A workload where the tree shrinks from $N$ to near-empty while
+    servicing read queries.  This would stress merge and redistribute
+    paths, and test whether search throughput degrades as the tree
+    becomes sparsely populated.  Matryoshka's CL sub-node merge and
+    page-level redistribute are designed for graceful degradation, but
+    extreme sparsity (few keys spread across many pages) could hurt
+    cache utilisation.
+
+  \item[Bulk-load comparison]
+    Timing the bulk-load operation itself (currently untimed) would
+    highlight structural differences: matryoshka distributes keys
+    across CL sub-nodes within pages in a single bottom-up pass;
+    TLX and Abseil use repeated insertion; \texttt{std::set} has no
+    bulk-load optimisation.
+\end{description}
 
 \subsection{Overall Assessment}
 
 The matryoshka nesting design achieves competitive insert and delete
 throughput while preserving SIMD-accelerated search at every level of
 the hierarchy.  Each modification touches a single cache-line sub-node
-rather than rebuilding an entire page, yielding throughput within
-\VAR{insert_slowdown_factor}$\times$ of the best B-tree competitor on
-insert-heavy workloads and \VAR{delete_slowdown_factor}$\times$ on
-delete-heavy workloads at the largest dataset size ($N{=}\num{\VAR{largest_n}}$).
+rather than rebuilding an entire sorted leaf array.  At the largest
+dataset size ($N{=}\num{\VAR{largest_n}}$), matryoshka's throughput is
+within \VAR{insert_slowdown_factor}$\times$ of the best B-tree
+competitor on insert-heavy workloads and
+\VAR{delete_slowdown_factor}$\times$ on delete-heavy workloads.
+
+The primary cost of the nesting design is a constant-factor overhead
+per modification (CL sub-tree navigation), which the flat sorted-array
+B-trees avoid.  This overhead is most visible at small $N$ where the
+outer tree is shallow and the per-operation cost is dominated by
+in-leaf work.  At large $N$, where the outer tree traversal and cache
+misses dominate, the nesting overhead is amortised and matryoshka's
+SIMD search and dense page layout become decisive advantages.
 
 %% ═══════════════════════════════════ Recommendations ═══════════════════════
-\section{Future Directions}
+\section{Improvements Since Initial Report}
 
-\subsection{Deeper Nesting: Superpage-Level Sub-Trees}
+\subsection{Superpage-Level Nesting (Implemented)}
 
-The current design nests CL sub-nodes within 4\,KiB pages.  A natural
-extension is to nest 4\,KiB page sub-nodes within 2\,MiB superpages,
-adding a third level to the matryoshka hierarchy.  This would reduce
-outer-tree height and confine more operations within a single TLB entry.
-\texttt{mt\_hierarchy\_init\_superpage} provides the skeleton for this.
+The nesting now extends to three levels: CL sub-nodes (64\,B) within
+4\,KiB pages within 2\,MiB superpages.  Each superpage contains a
+B+ tree of page-level sub-nodes, with page-level internal nodes
+(681 separator keys, 682 children per 4\,KiB page) routing searches
+to up to 510 page leaves.  Maximum capacity per superpage:
+$510 \times 855 \approx 436\text{K}$ keys.  This confines most
+operations to a single TLB entry and reduces outer-tree height.
+Enable via \texttt{mt\_hierarchy\_init\_superpage}.
 
-\subsection{Wider SIMD: AVX2 and AVX-512}
+\subsection{Wider SIMD: AVX2 and AVX-512 (Implemented)}
 
-The current CL sub-nodes are sized for SSE2 (128-bit).  AVX2 (256-bit)
-could double the keys per SIMD comparison, reducing sub-tree height.
-AVX-512 would enable 512-bit (one full cache line) operations, though
-the CL sub-node format would need restructuring.
+Compile-time SIMD width selection via \texttt{-DMT\_SIMD=avx2} or
+\texttt{-DMT\_SIMD=avx512}.  AVX2 (256-bit) processes 8 keys per
+comparison in CL leaf predecessor search, CL internal search, and
+outer internal node search.  AVX-512 (512-bit) processes 16 keys
+per comparison using masked operations.  Unaligned loads handle the
+4-byte header offset within CL sub-nodes.  SSE2 (128-bit, 4 keys)
+remains the baseline fallback.
 
-\subsection{Batch Insert API}
+\subsection{Batch Insert and Delete API (Implemented)}
 
-Provide \texttt{matryoshka\_insert\_batch(tree, keys, k)}: sort incoming
-keys, route each to its target CL leaf, and batch the insertions to
-amortise sub-tree navigation.  Useful for bulk-loading from unsorted
-input without pre-sorting.
+\texttt{matryoshka\_insert\_batch(tree, keys, n)} and
+\texttt{matryoshka\_delete\_batch(tree, keys, n)} sort incoming keys,
+group them by target leaf, and amortise outer-tree traversal across
+each group.  On page-full or underflow, the path is re-navigated for
+remaining keys.  Both functions work with page leaves and superpages.
 
-\subsection{Variable-Length Keys}
+\subsection{Future: Variable-Length Keys}
 
 The current 4-byte \texttt{int32\_t} key format could be extended to
 variable-length keys by storing key offsets or using indirection within

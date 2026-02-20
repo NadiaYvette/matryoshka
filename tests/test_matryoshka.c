@@ -642,6 +642,241 @@ static void test_arena_co_location(void)
     PASS();
 }
 
+/* ── Batch tests ─────────────────────────────────────────────── */
+
+static void test_batch_insert_basic(void)
+{
+    TEST(batch_insert_basic);
+    matryoshka_tree_t *t = matryoshka_create();
+    int32_t keys[] = {50, 10, 30, 20, 40};
+    size_t inserted = matryoshka_insert_batch(t, keys, 5);
+    ASSERT(inserted == 5, "wrong insert count");
+    ASSERT(matryoshka_size(t) == 5, "wrong size");
+    for (int i = 0; i < 5; i++)
+        ASSERT(matryoshka_contains(t, keys[i]), "key not found");
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_batch_insert_duplicates(void)
+{
+    TEST(batch_insert_with_duplicates);
+    matryoshka_tree_t *t = matryoshka_create();
+    matryoshka_insert(t, 10);
+    int32_t keys[] = {10, 20, 20, 30};
+    size_t inserted = matryoshka_insert_batch(t, keys, 4);
+    ASSERT(inserted == 2, "should insert 20,30 only");
+    ASSERT(matryoshka_size(t) == 3, "wrong size");
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_batch_insert_splits(void)
+{
+    TEST(batch_insert_triggers_splits);
+    matryoshka_tree_t *t = matryoshka_create();
+    int32_t keys[5000];
+    for (int i = 0; i < 5000; i++) keys[i] = i * 2;
+    size_t inserted = matryoshka_insert_batch(t, keys, 5000);
+    ASSERT(inserted == 5000, "wrong insert count");
+    ASSERT(matryoshka_size(t) == 5000, "wrong size");
+    for (int i = 0; i < 5000; i++)
+        ASSERT(matryoshka_contains(t, i * 2), "key not found");
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_batch_insert_into_existing(void)
+{
+    TEST(batch_insert_into_existing_tree);
+    int32_t initial[1000];
+    for (int i = 0; i < 1000; i++) initial[i] = i * 4;
+    matryoshka_tree_t *t = matryoshka_bulk_load(initial, 1000);
+    int32_t batch[1000];
+    for (int i = 0; i < 1000; i++) batch[i] = i * 4 + 2;
+    size_t inserted = matryoshka_insert_batch(t, batch, 1000);
+    ASSERT(inserted == 1000, "wrong count");
+    ASSERT(matryoshka_size(t) == 2000, "wrong size");
+    matryoshka_iter_t *it = matryoshka_iter_from(t, INT32_MIN);
+    int count = 0;
+    int32_t key, prev = INT32_MIN;
+    while (matryoshka_iter_next(it, &key)) {
+        ASSERT(key > prev, "not strictly increasing");
+        prev = key; count++;
+    }
+    ASSERT(count == 2000, "iteration count wrong");
+    matryoshka_iter_destroy(it);
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_batch_delete_basic(void)
+{
+    TEST(batch_delete_basic);
+    matryoshka_tree_t *t = matryoshka_create();
+    for (int i = 0; i < 100; i++) matryoshka_insert(t, i);
+    int32_t to_delete[] = {10, 50, 99, 0, 75};
+    size_t deleted = matryoshka_delete_batch(t, to_delete, 5);
+    ASSERT(deleted == 5, "wrong delete count");
+    ASSERT(matryoshka_size(t) == 95, "wrong size");
+    for (int i = 0; i < 5; i++)
+        ASSERT(!matryoshka_contains(t, to_delete[i]), "deleted key found");
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_batch_delete_heavy(void)
+{
+    TEST(batch_delete_heavy_3000);
+    int32_t all[5000];
+    for (int i = 0; i < 5000; i++) all[i] = i;
+    matryoshka_tree_t *t = matryoshka_bulk_load(all, 5000);
+
+    int32_t to_delete[3000];
+    for (int i = 0; i < 3000; i++) to_delete[i] = i * 2 + 1; /* odd numbers < 6000 */
+    size_t deleted = matryoshka_delete_batch(t, to_delete, 3000);
+    /* Only odd numbers 1,3,...,4999 exist = 2500 */
+    ASSERT(deleted == 2500, "wrong delete count");
+    ASSERT(matryoshka_size(t) == 2500, "wrong size");
+
+    /* All even numbers should remain. */
+    for (int i = 0; i < 5000; i += 2)
+        ASSERT(matryoshka_contains(t, i), "even key missing");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+/* ── Superpage tests ──────────────────────────────────────────── */
+
+static void test_sp_create_insert(void)
+{
+    TEST(superpage_create_insert);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_superpage(&h);
+    matryoshka_tree_t *t = matryoshka_create_with(&h);
+    ASSERT(t != NULL, "create failed");
+    ASSERT(matryoshka_size(t) == 0, "not empty");
+
+    for (int i = 0; i < 1000; i++)
+        ASSERT(matryoshka_insert(t, i * 3), "insert failed");
+    ASSERT(matryoshka_size(t) == 1000, "wrong size");
+    for (int i = 0; i < 1000; i++)
+        ASSERT(matryoshka_contains(t, i * 3), "key not found");
+    ASSERT(!matryoshka_contains(t, 1), "phantom key");
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_sp_bulk_load(void)
+{
+    TEST(superpage_bulk_load_10000);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_superpage(&h);
+    int32_t *keys = malloc(10000 * sizeof(int32_t));
+    for (int i = 0; i < 10000; i++) keys[i] = i;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, 10000, &h);
+    ASSERT(t != NULL, "bulk_load failed");
+    ASSERT(matryoshka_size(t) == 10000, "wrong size");
+    for (int i = 0; i < 10000; i++)
+        ASSERT(matryoshka_contains(t, i), "key not found");
+    matryoshka_destroy(t);
+    free(keys);
+    PASS();
+}
+
+static void test_sp_page_split(void)
+{
+    TEST(superpage_page_split);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_superpage(&h);
+    matryoshka_tree_t *t = matryoshka_create_with(&h);
+
+    /* Insert enough keys to force page splits within the superpage.
+       Each page holds ~855 keys; insert 5000 to use ~6 pages. */
+    for (int i = 0; i < 5000; i++)
+        ASSERT(matryoshka_insert(t, i), "insert failed");
+    ASSERT(matryoshka_size(t) == 5000, "wrong size");
+
+    /* Verify all keys via iteration. */
+    matryoshka_iter_t *it = matryoshka_iter_from(t, INT32_MIN);
+    int count = 0;
+    int32_t key, prev = INT32_MIN;
+    while (matryoshka_iter_next(it, &key)) {
+        ASSERT(key > prev, "not strictly increasing");
+        prev = key; count++;
+    }
+    ASSERT(count == 5000, "iteration count wrong");
+    matryoshka_iter_destroy(it);
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_sp_delete(void)
+{
+    TEST(superpage_delete);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_superpage(&h);
+    int32_t keys[2000];
+    for (int i = 0; i < 2000; i++) keys[i] = i;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, 2000, &h);
+
+    /* Delete odd keys. */
+    for (int i = 1; i < 2000; i += 2)
+        ASSERT(matryoshka_delete(t, i), "delete failed");
+    ASSERT(matryoshka_size(t) == 1000, "wrong size");
+
+    /* Even keys should remain. */
+    for (int i = 0; i < 2000; i += 2)
+        ASSERT(matryoshka_contains(t, i), "even key missing");
+    for (int i = 1; i < 2000; i += 2)
+        ASSERT(!matryoshka_contains(t, i), "deleted odd key found");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_sp_iterator(void)
+{
+    TEST(superpage_iterator);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_superpage(&h);
+    int32_t keys[3000];
+    for (int i = 0; i < 3000; i++) keys[i] = i * 2;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, 3000, &h);
+
+    /* Iterate from midpoint. */
+    matryoshka_iter_t *it = matryoshka_iter_from(t, 3000);
+    int count = 0;
+    int32_t key;
+    while (matryoshka_iter_next(it, &key)) count++;
+    ASSERT(count == 1500, "wrong count from midpoint");
+    matryoshka_iter_destroy(it);
+    matryoshka_destroy(t);
+    PASS();
+}
+
+static void test_sp_predecessor_search(void)
+{
+    TEST(superpage_predecessor_search);
+    mt_hierarchy_t h;
+    mt_hierarchy_init_superpage(&h);
+    int32_t keys[100];
+    for (int i = 0; i < 100; i++) keys[i] = i * 10;
+    matryoshka_tree_t *t = matryoshka_bulk_load_with(keys, 100, &h);
+
+    int32_t result;
+    ASSERT(matryoshka_search(t, 55, &result) && result == 50,
+           "predecessor of 55 should be 50");
+    ASSERT(matryoshka_search(t, 990, &result) && result == 990,
+           "predecessor of 990 should be 990");
+    ASSERT(!matryoshka_search(t, -1, &result),
+           "no predecessor below 0");
+
+    matryoshka_destroy(t);
+    PASS();
+}
+
 /* ── Main ─────────────────────────────────────────────────────── */
 
 int main(void)
@@ -678,6 +913,18 @@ int main(void)
     test_page_subtree_capacity();
     test_arena_basic();
     test_arena_co_location();
+    test_batch_insert_basic();
+    test_batch_insert_duplicates();
+    test_batch_insert_splits();
+    test_batch_insert_into_existing();
+    test_batch_delete_basic();
+    test_batch_delete_heavy();
+    test_sp_create_insert();
+    test_sp_bulk_load();
+    test_sp_page_split();
+    test_sp_delete();
+    test_sp_iterator();
+    test_sp_predecessor_search();
 
     printf("\n  %d/%d tests passed.\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

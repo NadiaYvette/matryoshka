@@ -284,12 +284,13 @@ def run_perf_stat(bench_binary, library, workload, size):
         counters = {}
         for line in proc.stderr.splitlines():
             line = line.strip()
-            # perf stat output: "123,456 event-name ..." or "123.456 event"
-            # On hybrid CPUs: "123,456 cpu_core/event/u ..."
-            # Match: number (with , or . separators) then event name
-            m = re.match(r"^([\d.,]+)\s+(?:cpu_\w+/)?([\w-]+)(?:/\w+)?\s", line)
+            # perf stat output formats:
+            #   "198137  cache-misses  ..."           (non-hybrid)
+            #   "198137  cpu_atom/cache-misses/  ..."  (hybrid Intel P/E)
+            # Numbers may have , separators (LC_ALL=C uses none).
+            m = re.match(r"^([\d,]+)\s+(?:cpu_\w+/)?([\w-]+)/?", line)
             if m:
-                val_str = m.group(1).replace(",", "").replace(".", "")
+                val_str = m.group(1).replace(",", "")
                 try:
                     value = int(val_str)
                 except ValueError:
@@ -356,8 +357,14 @@ def run_perf_record(bench_binary, library, workload, size):
                 cmd_record, capture_output=True, text=True, timeout=600,
             )
             if proc.returncode != 0:
+                print(f"    perf record exit code {proc.returncode}",
+                      flush=True)
+                if proc.stderr:
+                    print(f"    stderr: {proc.stderr.strip()[:200]}",
+                          flush=True)
                 return []
-        except (subprocess.TimeoutExpired, OSError):
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"    perf record exception: {e}", flush=True)
             return []
 
         # Report
@@ -370,21 +377,89 @@ def run_perf_record(bench_binary, library, workload, size):
             proc = subprocess.run(
                 cmd_report, capture_output=True, text=True, timeout=60,
             )
-        except (subprocess.TimeoutExpired, OSError):
+            if proc.returncode != 0:
+                print(f"    perf report exit code {proc.returncode}",
+                      flush=True)
+                if proc.stderr:
+                    print(f"    stderr: {proc.stderr.strip()[:200]}",
+                          flush=True)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"    perf report exception: {e}", flush=True)
             return []
 
-        top = []
+        # Parse all matching lines across event groups (hybrid CPUs
+        # produce separate cpu_atom and cpu_core sections).
+        by_sym = {}
         for line in proc.stdout.splitlines():
             line = line.strip()
-            # Format: "  XX.XX%  binary  [.] symbol_name"
-            m = re.match(r"^(\d+\.\d+)%\s+\S+\s+\[\.\]\s+(.+)$", line)
+            # Format: "  XX.XX%  command  shared_object  [.] symbol_name"
+            m = re.match(r"^(\d+\.\d+)%\s+.+\[\.\]\s+(.+)$", line)
             if m:
                 pct = float(m.group(1))
                 sym = m.group(2).strip()
-                top.append((pct, sym))
-            if len(top) >= 20:
-                break
-        return top
+                by_sym[sym] = by_sym.get(sym, 0.0) + pct
+
+        # Sort by descending overhead, return top 20
+        top = sorted(by_sym.items(), key=lambda x: -x[1])[:20]
+        return [(pct, sym) for sym, pct in top]
+
+
+# ── Perf Cache-Miss Attribution ────────────────────────────────────
+
+def run_perf_cache_misses(bench_binary, library, workload, size):
+    """Run perf record -e cache-misses + perf report to attribute cache
+    misses per function.
+
+    Returns list of (percent, symbol) tuples for top functions.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        perf_data = os.path.join(tmpdir, "perf.data")
+        cmd_record = [
+            "perf", "record", "-e", "cache-misses", "-o", perf_data, "--",
+            str(bench_binary),
+            "--library", library,
+            "--workload", workload,
+            "--size", str(size),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd_record, capture_output=True, text=True, timeout=600,
+            )
+            if proc.returncode != 0:
+                print(f"    perf record (cache-misses) exit code {proc.returncode}",
+                      flush=True)
+                return []
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"    perf record (cache-misses) exception: {e}", flush=True)
+            return []
+
+        cmd_report = [
+            "perf", "report", "-i", perf_data,
+            "--stdio", "--no-children",
+            "-g", "none", "--percent-limit", "1.0",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd_report, capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode != 0:
+                print(f"    perf report (cache-misses) exit code {proc.returncode}",
+                      flush=True)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            print(f"    perf report (cache-misses) exception: {e}", flush=True)
+            return []
+
+        by_sym = {}
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            m = re.match(r"^(\d+\.\d+)%\s+.+\[\.\]\s+(.+)$", line)
+            if m:
+                pct = float(m.group(1))
+                sym = m.group(2).strip()
+                by_sym[sym] = by_sym.get(sym, 0.0) + pct
+
+        top = sorted(by_sym.items(), key=lambda x: -x[1])[:20]
+        return [(pct, sym) for sym, pct in top]
 
 
 # ── Chart Generation ──────────────────────────────────────────────
@@ -731,42 +806,86 @@ def _compute_analysis_vars(results, perf_data, profile_top, libraries, sizes):
     """Compute data-driven variables for the analysis sections of the template."""
     ctx = {}
     largest = max(sizes) if sizes else 0
+    smallest = min(sizes) if sizes else 0
 
-    # Index: (library, workload) -> mops at largest size
-    by_key = {}
+    # Index: (library, workload) -> mops at given size
+    by_key = {}          # at largest size
+    by_key_1m = {}       # at 1M
+    by_key_small = {}    # at smallest size
+    all_by_key = {}      # (library, workload, n) -> mops
     for r in results:
-        if r["n"] == largest:
-            by_key[(r["library"], r["workload"])] = r.get("mops", 0)
-
-    # Also index at 1M for some metrics
-    by_key_1m = {}
-    for r in results:
-        if r["n"] == 1048576:
-            by_key_1m[(r["library"], r["workload"])] = r.get("mops", 0)
+        lib, wl, n = r["library"], r["workload"], r["n"]
+        mops = r.get("mops", 0)
+        all_by_key[(lib, wl, n)] = mops
+        if n == largest:
+            by_key[(lib, wl)] = mops
+        if n == 1048576:
+            by_key_1m[(lib, wl)] = mops
+        if n == smallest:
+            by_key_small[(lib, wl)] = mops
 
     # Use 1M data if available, else largest
     ref = by_key_1m if by_key_1m else by_key
+    competitors = [lib for lib in libraries if lib != "matryoshka"]
 
-    # Specific throughput values
-    ctx["matryoshka_rand_insert_mops"] = f"{ref.get(('matryoshka', 'rand_insert'), 0):.2f}"
-    ctx["stdset_rand_insert_mops"] = f"{ref.get(('std_set', 'rand_insert'), 0):.2f}"
+    # ── Per-library throughput at largest and smallest sizes ──
+    all_libs = ["matryoshka", "std_set", "tlx_btree", "libart", "abseil_btree"]
+    lib_short = {
+        "matryoshka": "mat", "std_set": "stdset", "tlx_btree": "tlx",
+        "libart": "art", "abseil_btree": "abseil",
+    }
+    workloads = ["seq_insert", "rand_insert", "rand_delete", "mixed",
+                 "ycsb_a", "ycsb_b", "search_after_churn"]
+
+    for lib in all_libs:
+        short = lib_short[lib]
+        for wl in workloads:
+            val_l = by_key.get((lib, wl), 0)
+            val_s = by_key_small.get((lib, wl), 0)
+            val_m = ref.get((lib, wl), 0)
+            ctx[f"{short}_{wl}_mops"] = f"{val_m:.2f}"
+            ctx[f"{short}_{wl}_mops_large"] = f"{val_l:.2f}"
+            ctx[f"{short}_{wl}_mops_small"] = f"{val_s:.2f}"
+
+    # Specific legacy values (keep backward compat)
+    ctx["matryoshka_rand_insert_mops"] = ctx["mat_rand_insert_mops"]
+    ctx["stdset_rand_insert_mops"] = ctx["stdset_rand_insert_mops"]
+    ctx["matryoshka_search_mops"] = ctx["mat_search_after_churn_mops"]
 
     # Best non-matryoshka competitor on rand_insert
-    competitors = [lib for lib in libraries if lib != "matryoshka"]
     best_ri = max((ref.get((c, "rand_insert"), 0) for c in competitors), default=0)
     ctx["best_competitor_rand_insert_mops"] = f"{best_ri:.2f}"
 
-    # Search throughput
-    ctx["matryoshka_search_mops"] = f"{ref.get(('matryoshka', 'search_after_churn'), 0):.2f}"
-
-    # Slowdown factors (at largest size, matryoshka vs best competitor)
+    # Slowdown/speedup factors (at largest size, matryoshka vs each lib)
     mat_ri = by_key.get(("matryoshka", "rand_insert"), 0)
     best_ri_l = max((by_key.get((c, "rand_insert"), 0) for c in competitors), default=0)
-    ctx["insert_slowdown_factor"] = f"{best_ri_l / mat_ri:.0f}" if mat_ri > 0 else "N/A"
+    ctx["insert_slowdown_factor"] = f"{best_ri_l / mat_ri:.1f}" if mat_ri > 0 else "N/A"
 
     mat_rd = by_key.get(("matryoshka", "rand_delete"), 0)
     best_rd = max((by_key.get((c, "rand_delete"), 0) for c in competitors), default=0)
-    ctx["delete_slowdown_factor"] = f"{best_rd / mat_rd:.0f}" if mat_rd > 0 else "N/A"
+    ctx["delete_slowdown_factor"] = f"{best_rd / mat_rd:.1f}" if mat_rd > 0 else "N/A"
+
+    # Per-workload ratio: matryoshka / each competitor at largest size
+    for wl in workloads:
+        mat_v = by_key.get(("matryoshka", wl), 0)
+        for lib in competitors:
+            short = lib_short.get(lib, lib)
+            other_v = by_key.get((lib, wl), 0)
+            if mat_v > 0 and other_v > 0:
+                ctx[f"ratio_mat_{short}_{wl}"] = f"{mat_v / other_v:.2f}"
+            else:
+                ctx[f"ratio_mat_{short}_{wl}"] = "N/A"
+
+    # Scaling degradation: ratio of small-N to large-N throughput
+    for lib in all_libs:
+        short = lib_short[lib]
+        for wl in workloads:
+            vs = by_key_small.get((lib, wl), 0)
+            vl = by_key.get((lib, wl), 0)
+            if vs > 0 and vl > 0:
+                ctx[f"scale_{short}_{wl}"] = f"{vs / vl:.1f}"
+            else:
+                ctx[f"scale_{short}_{wl}"] = "N/A"
 
     # B-tree competitors gap
     tlx_ri = by_key.get(("tlx_btree", "rand_insert"), 0)
@@ -780,30 +899,59 @@ def _compute_analysis_vars(results, perf_data, profile_top, libraries, sizes):
         ctx["btree_insert_gap_pct"] = "N/A"
 
     ctx["largest_n"] = str(largest)
+    ctx["smallest_n"] = str(smallest)
 
-    # Perf-derived metrics
+    # ── Perf-derived metrics (per-library) ──
     def _perf_rate(lib, miss_key, ref_key):
         if not perf_data or lib not in perf_data:
             return "N/A"
         c = perf_data[lib]
         m, r2 = c.get(miss_key), c.get(ref_key)
-        if m and r2 and r2 > 0:
+        if m is not None and r2 and r2 > 0:
             return f"{1000.0 * m / r2:.1f}"
         return "N/A"
 
+    def _perf_ipc(lib):
+        if not perf_data or lib not in perf_data:
+            return "N/A"
+        c = perf_data[lib]
+        cyc, ins = c.get("cycles"), c.get("instructions")
+        return f"{ins / cyc:.2f}" if cyc and ins and cyc > 0 else "N/A"
+
+    def _perf_pct(lib, miss_key, ref_key):
+        """Return miss rate as percentage (e.g. '5.8')."""
+        if not perf_data or lib not in perf_data:
+            return "N/A"
+        c = perf_data[lib]
+        m, r2 = c.get(miss_key), c.get(ref_key)
+        if m is not None and r2 and r2 > 0:
+            return f"{100.0 * m / r2:.1f}"
+        return "N/A"
+
+    # Per-library hardware counter rows for table
+    hw_rows = []
+    for lib in all_libs:
+        if perf_data and lib in perf_data:
+            short = lib_short[lib]
+            hw_rows.append({
+                "name": tex_escape(lib),
+                "cache_miss_pct": _perf_pct(lib, "cache-misses", "cache-references"),
+                "l1d_miss_pct": _perf_pct(lib, "L1-dcache-load-misses", "L1-dcache-loads"),
+                "llc_miss_pct": _perf_pct(lib, "LLC-load-misses", "LLC-loads"),
+                "dtlb_miss_per_1k": _perf_rate(lib, "dTLB-load-misses", "dTLB-loads"),
+                "branch_miss_pct": _perf_pct(lib, "branch-misses", "branches"),
+                "ipc": _perf_ipc(lib),
+            })
+    ctx["hw_rows"] = hw_rows
+
+    # Legacy scalar values (backward compat)
     ctx["matryoshka_dtlb_miss_rate"] = _perf_rate("matryoshka", "dTLB-load-misses", "dTLB-loads")
     ctx["stdset_dtlb_miss_rate"] = _perf_rate("std_set", "dTLB-load-misses", "dTLB-loads")
     ctx["matryoshka_llc_miss_rate"] = _perf_rate("matryoshka", "LLC-load-misses", "LLC-loads")
     ctx["stdset_llc_miss_rate"] = _perf_rate("std_set", "LLC-load-misses", "LLC-loads")
+    ctx["matryoshka_ipc"] = _perf_ipc("matryoshka")
 
-    if perf_data and "matryoshka" in perf_data:
-        c = perf_data["matryoshka"]
-        cyc, ins = c.get("cycles"), c.get("instructions")
-        ctx["matryoshka_ipc"] = f"{ins / cyc:.2f}" if cyc and ins and cyc > 0 else "N/A"
-    else:
-        ctx["matryoshka_ipc"] = "N/A"
-
-    # Profile: percentage in mt_page_insert (previously mt_leaf_build)
+    # Profile: percentage in mt_page_insert
     ctx["pct_leaf_build"] = "N/A"
     if profile_top:
         for pct, sym in profile_top:
@@ -815,7 +963,8 @@ def _compute_analysis_vars(results, perf_data, profile_top, libraries, sizes):
 
 
 def generate_report(results, sys_info, libraries, sizes, output_path,
-                    build_dir, perf_data=None, profile_top=None):
+                    build_dir, perf_data=None, profile_top=None,
+                    cache_miss_top=None):
     """Orchestrate chart generation, LaTeX rendering, and PDF compilation."""
     if not results:
         print("No benchmark results to report.")
@@ -893,6 +1042,16 @@ def generate_report(results, sys_info, libraries, sizes, output_path,
                 "source": "bench\\_compare",
             })
     context["profile_functions"] = profile_functions
+
+    # Cache-miss attribution functions (list of dicts with pct, name)
+    cache_miss_functions = []
+    if cache_miss_top:
+        for pct, sym in cache_miss_top:
+            cache_miss_functions.append({
+                "pct": f"{pct:.1f}",
+                "name": tex_escape(sym),
+            })
+    context["cache_miss_functions"] = cache_miss_functions
 
     # Results table (list of dicts matching template's \VAR{r.library} etc.)
     context["results"] = []
@@ -1035,6 +1194,23 @@ def main():
         else:
             print("  perf record/report failed (may need elevated privileges).")
 
+    # ── Perf cache-miss attribution ──────────────────────────────
+    cache_miss_top = None
+    if use_perf:
+        cm_size = 4194304
+        if cm_size not in sizes:
+            cm_size = max(sizes)
+        print(f"\nRunning perf record -e cache-misses on matryoshka/rand_insert "
+              f"N={fmt_size(cm_size)}...", flush=True)
+        cache_miss_top = run_perf_cache_misses(
+            bench_binary, "matryoshka", "rand_insert", cm_size)
+        if cache_miss_top:
+            print(f"  Captured {len(cache_miss_top)} cache-miss functions.")
+            for pct, sym in cache_miss_top[:5]:
+                print(f"    {pct:5.1f}%  {sym}")
+        else:
+            print("  perf record (cache-misses) failed.")
+
     # ── Generate report ───────────────────────────────────────────
     print(f"\nGenerating report: {args.output}")
     ok = generate_report(
@@ -1042,6 +1218,7 @@ def main():
         build_dir=str(build_dir),
         perf_data=perf_data,
         profile_top=profile_top,
+        cache_miss_top=cache_miss_top,
     )
 
     if ok:

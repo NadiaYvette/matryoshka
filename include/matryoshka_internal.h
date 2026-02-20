@@ -72,6 +72,9 @@ typedef struct mt_hierarchy {
     int     min_page_keys;    /* Minimum leaf occupancy for outer B+ tree */
     int     min_cl_keys;      /* Minimum CL leaf occupancy (7) */
     int     min_cl_children;  /* Minimum CL internal children (7) */
+    bool    use_superpages;   /* Whether leaves are 2 MiB superpages */
+    int     sp_max_keys;      /* Max keys per superpage (~436K) */
+    int     min_sp_keys;      /* Min superpage occupancy for outer tree */
 } mt_hierarchy_t;
 
 /* ── Arena allocator types ──────────────────────────────────── */
@@ -145,6 +148,51 @@ typedef union mt_cl_slot {
 _Static_assert(sizeof(mt_cl_slot_t) == MT_CL_SIZE,
                "mt_cl_slot_t must be exactly 64 bytes");
 
+/* ── Superpage constants ────────────────────────────────────── */
+
+#define MT_SP_SIZE         (2u * 1024 * 1024)   /* 2 MiB */
+#define MT_SP_PAGES        (MT_SP_SIZE / MT_PAGE_SIZE)  /* 512 */
+
+/* Page-level internal within superpage:
+   8 B header + 681 × 4 B keys + 682 × 2 B children = 4096 B */
+#define MT_SP_MAX_IKEYS    681
+#define MT_SP_MIN_IKEYS    (MT_SP_MAX_IKEYS / 2)
+
+/* ── Superpage header (page 0 of a 2 MiB region) ──────────── */
+
+struct mt_sp_header;  /* forward decl */
+
+typedef struct mt_sp_header {
+    uint16_t  type;            /* MT_NODE_LEAF from outer tree */
+    uint16_t  _pad0;
+    uint32_t  nkeys;           /* total keys across all page leaves */
+    uint16_t  root_page;       /* page index of sub-tree root (1–511) */
+    uint8_t   sub_height;      /* page sub-tree height (0 or 1) */
+    uint8_t   _pad1;
+    uint16_t  npages_used;     /* number of pages allocated */
+    uint16_t  _pad2;
+    uint64_t  page_bitmap[8];  /* 512 bits for page allocation */
+    struct mt_sp_header *prev; /* previous superpage (outer tree) */
+    struct mt_sp_header *next; /* next superpage (outer tree) */
+    uint8_t   _reserved[4000]; /* pad to 4096 */
+} mt_sp_header_t;
+
+_Static_assert(sizeof(mt_sp_header_t) == MT_PAGE_SIZE,
+               "mt_sp_header_t must be exactly 4096 bytes");
+
+/* ── Page-level internal node within superpage ─────────────── */
+
+typedef struct mt_sp_inode {
+    uint16_t  type;                         /* 2 = SP internal */
+    uint16_t  nkeys;
+    uint32_t  _pad;
+    int32_t   keys[MT_SP_MAX_IKEYS];       /* separator keys */
+    uint16_t  children[MT_SP_MAX_IKEYS+1]; /* page indices (0–511) */
+} mt_sp_inode_t;
+
+_Static_assert(sizeof(mt_sp_inode_t) == MT_PAGE_SIZE,
+               "mt_sp_inode_t must be exactly 4096 bytes");
+
 /* ── Page header (slot 0 of a leaf page) ────────────────────── */
 
 typedef struct mt_page_header {
@@ -203,6 +251,50 @@ typedef union mt_node {
     mt_inode_t     inode;
     mt_lnode_t     lnode;
 } mt_node_t;
+
+/* ── Pointer tagging ───────────────────────────────────────────── */
+/*
+ * Leaf pointers in outer-tree children[] arrays encode metadata in
+ * the low 12 bits (guaranteed zero by 4096-byte alignment):
+ *   bits 0–5: root_slot  (CL sub-tree root slot index, 1–63)
+ *   bits 6–8: sub_height (CL sub-tree height, 0–7)
+ *
+ * This lets find_leaf() prefetch the CL root cache line one outer-tree
+ * level earlier — overlapping the prefetch with the inode search at the
+ * next level — instead of waiting until the page header is loaded.
+ */
+
+#define MT_PTR_TAG_MASK       ((uintptr_t)0xFFF)
+#define MT_PTR_SLOT_MASK      ((uintptr_t)0x03F)   /* bits 0–5 */
+#define MT_PTR_HEIGHT_SHIFT   6
+#define MT_PTR_HEIGHT_MASK    ((uintptr_t)0x1C0)   /* bits 6–8 */
+
+/* Strip tag bits, returning the raw page-aligned pointer. */
+static inline mt_node_t *mt_untag(mt_node_t *ptr)
+{
+    return (mt_node_t *)((uintptr_t)ptr & ~MT_PTR_TAG_MASK);
+}
+
+/* Tag a leaf pointer with the page's current root_slot and sub_height. */
+static inline mt_node_t *mt_tag_leaf_ptr(mt_node_t *ptr)
+{
+    mt_lnode_t *leaf = &ptr->lnode;
+    uintptr_t tag = (uintptr_t)leaf->header.root_slot |
+                    ((uintptr_t)leaf->header.sub_height << MT_PTR_HEIGHT_SHIFT);
+    return (mt_node_t *)((uintptr_t)ptr | tag);
+}
+
+/* Extract root_slot from a tagged pointer. */
+static inline uint8_t mt_ptr_root_slot(mt_node_t *ptr)
+{
+    return (uint8_t)((uintptr_t)ptr & MT_PTR_SLOT_MASK);
+}
+
+/* Extract sub_height from a tagged pointer. */
+static inline uint8_t mt_ptr_sub_height(mt_node_t *ptr)
+{
+    return (uint8_t)(((uintptr_t)ptr >> MT_PTR_HEIGHT_SHIFT) & 0x7);
+}
 
 /* ── Tree root ──────────────────────────────────────────────── */
 
@@ -289,6 +381,26 @@ mt_node_t *mt_alloc_inode(void);
 mt_node_t *mt_alloc_lnode(const mt_hierarchy_t *hier, mt_allocator_t *alloc);
 void mt_free_inode(mt_node_t *node);
 void mt_free_lnode(mt_node_t *node, mt_allocator_t *alloc);
+
+/* ── Superpage operations (superpage.c) ────────────────────── */
+
+void        mt_sp_init(void *sp);
+mt_status_t mt_sp_insert(void *sp, int32_t key, const mt_hierarchy_t *hier);
+mt_status_t mt_sp_delete(void *sp, int32_t key, const mt_hierarchy_t *hier);
+bool        mt_sp_search_key(const void *sp, int32_t key, int32_t *result);
+bool        mt_sp_contains(const void *sp, int32_t key);
+int32_t     mt_sp_split(void *sp, void *new_sp, const mt_hierarchy_t *hier);
+void        mt_sp_bulk_load(void *sp, const int32_t *keys, int nkeys,
+                             const mt_hierarchy_t *hier);
+int         mt_sp_extract_sorted(const void *sp, int32_t *out);
+int32_t     mt_sp_min_key(const void *sp);
+int32_t     mt_sp_max_key(const void *sp);
+
+/* Get the first page leaf in a superpage (for iterator start). */
+mt_lnode_t *mt_sp_first_leaf(void *sp);
+
+/* Find the page leaf containing `key` in a superpage (for iterator seek). */
+mt_lnode_t *mt_sp_find_leaf(void *sp, int32_t key);
 
 /* ── Arena allocator (arena.c) ─────────────────────────────── */
 

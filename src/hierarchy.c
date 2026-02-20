@@ -55,20 +55,22 @@ void mt_hierarchy_init_default(mt_hierarchy_t *h)
     h->page_max_keys   = compute_page_max_keys(MT_CL_KEY_CAP,
                                                 MT_CL_CHILD_CAP,
                                                 MT_PAGE_SLOTS);
-    h->min_page_keys   = h->page_max_keys / 4;  /* looser min for page splits */
+    h->min_page_keys   = h->page_max_keys / 4;
+    h->use_superpages  = false;
+    h->sp_max_keys     = 0;
+    h->min_sp_keys     = 0;
 }
 
 void mt_hierarchy_init_superpage(mt_hierarchy_t *h)
 {
-    /* Superpage leaves: same CL-level structure but within 2 MiB pages.
-       The outer tree treats each 2 MiB superpage as a single leaf.
-       Within the superpage, we use a two-level nesting:
-       4 KiB page sub-nodes → CL sub-nodes → keys.
-       For now, use the same single-level CL nesting. */
     mt_hierarchy_init_default(h);
-    h->leaf_alloc = 2 * 1024 * 1024;
-    /* With 2 MiB / 64 B = 32768 CL slots, capacity is enormous.
-       page_slots is still 63 for now (TODO: multi-page nesting). */
+    h->leaf_alloc      = MT_SP_SIZE;
+    h->use_superpages  = true;
+    /* 511 usable pages (page 0 = header), but with height-1 sub-tree
+       we need 1 page for the root internal, leaving 510 page leaves.
+       Each page leaf holds up to page_max_keys (855). */
+    h->sp_max_keys     = 510 * h->page_max_keys;
+    h->min_sp_keys     = h->sp_max_keys / 4;
 }
 
 void mt_hierarchy_init_custom(mt_hierarchy_t *h, size_t leaf_alloc)

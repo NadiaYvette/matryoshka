@@ -79,6 +79,17 @@ bool matryoshka_insert(matryoshka_tree_t *tree, int32_t key);
    if it was not present.  O(log b · log_B n). */
 bool matryoshka_delete(matryoshka_tree_t *tree, int32_t key);
 
+/* Batch insert: insert n keys at once, amortizing tree traversal.
+   Keys need not be sorted or unique (sorted internally, duplicates skipped).
+   Returns the number of keys actually inserted. */
+size_t matryoshka_insert_batch(matryoshka_tree_t *tree,
+                                const int32_t *keys, size_t n);
+
+/* Batch delete: delete n keys at once, amortizing tree traversal.
+   Returns the number of keys actually deleted. */
+size_t matryoshka_delete_batch(matryoshka_tree_t *tree,
+                                const int32_t *keys, size_t n);
+
 /* ── Iteration ──────────────────────────────────────────────── */
 
 /* Iterator for in-order traversal. */
