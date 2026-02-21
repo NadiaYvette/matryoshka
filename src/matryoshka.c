@@ -1219,21 +1219,68 @@ size_t matryoshka_insert_batch(matryoshka_tree_t *tree,
     size_t i = 0;
     bool sp = tree->hier.use_superpages;
 
+    /* State kept across outer-loop iterations so we can advance to the
+       next sibling leaf without re-walking the outer tree. */
+    mt_path_t path[MT_MAX_HEIGHT];
+    mt_node_t *leaf_node = NULL;
+    int32_t upper = INT32_MAX;
+    bool have_path = false;
+
     while (i < n) {
         if (i > 0 && sorted[i] == sorted[i - 1]) { i++; continue; }
 
-        mt_path_t path[MT_MAX_HEIGHT];
-        mt_node_t *leaf_node = find_leaf_node(tree->root, tree->height,
-                                               sorted[i], path);
+        /* ── Navigate to the correct leaf ────────────────────── */
+        if (!have_path || (upper != INT32_MAX && sorted[i] >= upper)) {
+            /* Try sibling advance within the same parent inode. */
+            if (have_path && !sp && tree->height > 0 &&
+                upper != INT32_MAX && sorted[i] >= upper) {
+                mt_inode_t *parent = path[tree->height - 1].node;
+                int next_cidx = path[tree->height - 1].idx + 1;
+                int32_t next_upper = (next_cidx < parent->nkeys)
+                                     ? parent->keys[next_cidx] : INT32_MAX;
+                if (sorted[i] < next_upper || next_upper == INT32_MAX) {
+                    /* Fast path: advance to next sibling child. */
+                    path[tree->height - 1].idx = next_cidx;
+                    mt_node_t *raw = parent->children[next_cidx];
+                    leaf_node = mt_untag(raw);
+                    upper = next_upper;
+                    goto prefetch_next_and_insert;
+                }
+            }
 
-        int32_t upper = INT32_MAX;
-        if (tree->height > 0) {
-            mt_inode_t *parent = path[tree->height - 1].node;
-            int cidx = path[tree->height - 1].idx;
-            if (cidx < parent->nkeys)
-                upper = parent->keys[cidx];
+            /* Full outer-tree walk. */
+            leaf_node = find_leaf_node(tree->root, tree->height,
+                                       sorted[i], path);
+            have_path = true;
+
+            upper = INT32_MAX;
+            if (tree->height > 0) {
+                mt_inode_t *parent = path[tree->height - 1].node;
+                int cidx = path[tree->height - 1].idx;
+                if (cidx < parent->nkeys)
+                    upper = parent->keys[cidx];
+            }
         }
 
+prefetch_next_and_insert:
+        /* ── Eagerly prefetch the next sibling leaf's page header
+              and CL root slot.  The ~400-855 inserts for the current
+              leaf provide ample latency to hide the DRAM fetch. ── */
+        if (!sp && tree->height > 0) {
+            mt_inode_t *parent = path[tree->height - 1].node;
+            int cidx = path[tree->height - 1].idx;
+            if (cidx + 1 <= parent->nkeys) {
+                mt_node_t *next_raw = parent->children[cidx + 1];
+                uint8_t next_rs = mt_ptr_root_slot(next_raw);
+                mt_node_t *next_ptr = mt_untag(next_raw);
+                __builtin_prefetch(next_ptr, 0, 1);
+                if (next_rs > 0)
+                    __builtin_prefetch(&next_ptr->lnode.slots[next_rs - 1],
+                                       0, 1);
+            }
+        }
+
+        /* ── Inner loop: insert all keys for this leaf ───────── */
         while (i < n) {
             if (i > 0 && sorted[i] == sorted[i - 1]) { i++; continue; }
             if (upper != INT32_MAX && sorted[i] >= upper) break;
@@ -1242,7 +1289,8 @@ size_t matryoshka_insert_batch(matryoshka_tree_t *tree,
             if (sp)
                 status = mt_sp_insert(leaf_node, sorted[i], &tree->hier);
             else
-                status = mt_page_insert(&leaf_node->lnode, sorted[i], &tree->hier);
+                status = mt_page_insert(&leaf_node->lnode, sorted[i],
+                                         &tree->hier);
 
             if (status == MT_DUPLICATE) { i++; continue; }
 
@@ -1254,14 +1302,17 @@ size_t matryoshka_insert_batch(matryoshka_tree_t *tree,
                 continue;
             }
 
-            /* MT_PAGE_FULL: split and insert, then re-navigate. */
+            /* MT_PAGE_FULL: split and insert.  Path is stale after
+               split (parent may have been restructured). */
             if (sp)
                 split_sp_and_insert(tree, path, leaf_node, sorted[i]);
             else
-                split_leaf_and_insert(tree, path, &leaf_node->lnode, sorted[i]);
+                split_leaf_and_insert(tree, path, &leaf_node->lnode,
+                                       sorted[i]);
             tree->n++;
             inserted++;
             i++;
+            have_path = false;  /* force re-navigation after split */
             break;
         }
     }

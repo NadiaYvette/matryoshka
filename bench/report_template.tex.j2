@@ -1651,6 +1651,153 @@ improvement for batch workloads, potentially bringing matryoshka to
 $\sim$500\,ns/op at $N{=}16\text{M}$ --- competitive with libart's
 384\,ns/op.
 
+\subsection{Implementation Results: Approaches A--C}
+\label{sec:abc_results}
+
+Approaches A (superpages + fence keys), B (batched prefetch pipelining),
+and C (branchless binary search in outer inodes) have been implemented
+and benchmarked.
+
+\subsubsection{C. Branchless Binary Search --- Implementation}
+
+The \texttt{mt\_inode\_search} binary search loop (lines~89--102 of
+\texttt{inode.c}) was converted from a data-dependent \texttt{if/else}
+branch to arithmetic bit-masking:
+
+\begin{verbatim}
+int cmp  = (keys[mid] <= key);   // 0 or 1
+int mask = -cmp;                 // 0x00000000 or 0xFFFFFFFF
+lo += ((mid + 1) - lo) & mask;   // lo = mid+1 if cmp, else unchanged
+hi += (mid - hi) & ~mask;        // hi = mid if !cmp, else unchanged
+\end{verbatim}
+
+Disassembly confirms the compiler emits \texttt{setle} + \texttt{cmovle}
++ \texttt{and} instead of conditional jumps in the inner loop body.  The
+only branch is the well-predicted \texttt{while (lo < hi)} loop exit.
+
+\subsubsection{B. Batched Prefetch Pipelining --- Implementation}
+
+The \texttt{matryoshka\_insert\_batch} function was enhanced with two
+optimisations:
+
+\begin{enumerate}
+\item \textbf{Sibling-advance fast path.}  When sorted keys cross a
+  leaf boundary, the code checks whether the next key falls into the
+  next sibling child within the same parent inode.  Since outer inodes
+  hold up to 340 children, this skips the full outer-tree re-walk for
+  $\sim$339/340 of leaf transitions.
+
+\item \textbf{Eager next-sibling prefetch.}  At the start of each
+  leaf group, the code prefetches the next sibling leaf's page header
+  and CL root slot via the parent's tagged child pointer.  The
+  $\sim$400--855 inserts for the current leaf provide ample latency
+  to hide the DRAM fetch.
+\end{enumerate}
+
+These optimisations apply only to the batch insert API; single-key
+\texttt{matryoshka\_insert} is unchanged.
+
+\subsubsection{A. Superpages + Fence Keys --- Implementation}
+
+A new hierarchy initialiser \texttt{mt\_hierarchy\_init\_fence\_sp}
+combines fence keys (\texttt{cl\_strategy = MT\_CL\_STRAT\_FENCE})
+with 2\,MiB superpage allocation (\texttt{use\_superpages = true}).
+The two features compose naturally: the superpage code delegates to
+page-level functions that already check \texttt{cl\_strategy}.
+
+\subsubsection{Benchmark Results: Approaches A--C}
+
+\begin{table}[H]
+\centering
+\caption{Throughput (Mop/s) for \texttt{rand\_insert} after implementing
+  approaches A--C.  All matryoshka variants include branchless binary search
+  (approach C).  Batch prefetch (B) only affects \texttt{insert\_batch}.}
+\label{tab:abc_throughput}
+\begin{tabular}{lS[table-format=1.2]S[table-format=1.2]S[table-format=4.0]r}
+\toprule
+\textbf{Variant} & {$N{=}4\text{M}$} & {$N{=}16\text{M}$}
+  & {ns/op (16M)} & \textbf{vs.\ ART} \\
+\midrule
+Matryoshka (baseline)     & 1.87 & 1.11 &  901 & $0.54{\times}$ \\
+\rowcolor{lightgray!20}
+Matryoshka + fence        & 1.32 & 0.98 & 1020 & $0.48{\times}$ \\
+Matryoshka + fence + SP   & 1.17 & 0.94 & 1064 & $0.46{\times}$ \\
+\midrule
+libart (ART)              & 2.52 & 2.06 &  486 & $1.00{\times}$ \\
+TLX btree\_set            & 1.20 & 0.83 & 1205 & $0.40{\times}$ \\
+Abseil btree\_set         & 1.41 & 0.97 & 1031 & $0.47{\times}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Hardware Counter Impact}
+
+\begin{table}[H]
+\centering
+\caption{Selected hardware counters for \texttt{rand\_insert} at
+  $N{=}16\text{M}$.  Cache-miss ratio = cache-misses / cache-references.}
+\label{tab:abc_hwcounters}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Metric} & \textbf{Baseline} & \textbf{Fence} & \textbf{Fence+SP}
+  & \textbf{libart} \\
+\midrule
+Cache-miss ratio   & 76.9\% & 76.1\% & 53.3\% & 64.8\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Key findings from the hardware counter analysis:
+
+\begin{itemize}
+\item \textbf{Cache miss rate:} Superpages reduce the cache-miss ratio
+  from $\sim$76\% (fence) to $\sim$53\% (fence+SP) at $N{=}16\text{M}$.
+  The 2\,MiB TLB entries and spatial co-location of pages within
+  superpages substantially improve LLC hit rates.
+
+\item \textbf{Branchless binary search:} The \texttt{setle}/\texttt{cmovle}
+  codegen eliminates data-dependent branches in the outer inode search.
+  For inodes with $>$64 keys (where the AVX2 linear scan falls back to
+  binary search), this saves $\sim$4 mispredictions per search at
+  $\sim$15 cycles each.
+
+\item \textbf{Superpage throughput:} Despite the dramatic cache-miss
+  reduction, the fence+SP variant shows slightly lower throughput than
+  plain fence keys for random inserts.  The additional indirection through
+  the superpage page-level B+ sub-tree (finding the correct 4\,KiB page
+  within the 2\,MiB superpage) adds instructions that offset the cache
+  improvement.
+
+\item \textbf{Known limitation:} Large-scale random deletion with
+  superpages triggers a pre-existing infinite loop in the superpage
+  rebalance code (\texttt{rebalance\_sp}).  The issue is in the
+  superpage merge path when multiple superpages need to be consolidated.
+  Delete-heavy workloads (rand\_delete, mixed, search\_after\_churn)
+  are not available for the fence+SP variant at $N{\geq}2\text{M}$.
+\end{itemize}
+
+\subsubsection{Progress Toward libart Parity}
+
+At $N{=}16\text{M}$ random insert, the current standing:
+
+\begin{itemize}
+\item \textbf{libart (ART):} $\sim$2.06\,Mop/s (486\,ns/op)
+\item \textbf{Matryoshka + fence (with branchless search):}
+  $\sim$0.98\,Mop/s (1020\,ns/op) --- 2.1$\times$ slower than ART
+\item \textbf{Matryoshka + fence + superpages:}
+  $\sim$0.94\,Mop/s (1064\,ns/op) --- cache misses cut from 76\% to
+  53\%, but superpage overhead offsets the gain
+\end{itemize}
+
+The gap remains substantial (2$\times$).  The primary remaining
+bottleneck is the CL sub-tree traversal within each leaf page, which
+requires 2--3 serial cache-line loads.  The approaches implemented here
+(branchless search, batch prefetch, superpages) address the outer-tree
+descent but cannot reduce the intra-page serial dependency chain.
+Closing the gap would require restructuring the page-level layout
+(e.g., FAST-layout inodes, or flattening the CL sub-tree to a sorted
+array with SIMD search for small pages).
+
 \subsection{Future: Variable-Length Keys}
 
 The current 4-byte \texttt{int32\_t} key format could be extended to

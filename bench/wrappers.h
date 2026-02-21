@@ -136,6 +136,48 @@ public:
     }
 };
 
+/* ── matryoshka + fence keys + superpages ───────────────────── */
+
+class WrapperMatryoshkaFenceSP {
+    matryoshka_tree_t *tree_ = nullptr;
+public:
+    static const char *name() { return "matryoshka_fence_sp"; }
+    static const char *label() { return "Matryoshka + fence + superpages"; }
+
+    WrapperMatryoshkaFenceSP() {
+        mt_hierarchy_t h;
+        mt_hierarchy_init_fence_sp(&h);
+        tree_ = matryoshka_create_with(&h);
+    }
+    ~WrapperMatryoshkaFenceSP() { if (tree_) matryoshka_destroy(tree_); }
+
+    WrapperMatryoshkaFenceSP(const WrapperMatryoshkaFenceSP &) = delete;
+    WrapperMatryoshkaFenceSP &operator=(const WrapperMatryoshkaFenceSP &) = delete;
+
+    bool insert(int32_t key) { return matryoshka_insert(tree_, key); }
+    bool remove(int32_t key) { return matryoshka_delete(tree_, key); }
+    bool search(int32_t key) const {
+        int32_t r;
+        return matryoshka_search(tree_, key, &r);
+    }
+    bool contains(int32_t key) const {
+        return matryoshka_contains(tree_, key);
+    }
+    void bulk_load(const int32_t *keys, size_t n) {
+        if (tree_) matryoshka_destroy(tree_);
+        mt_hierarchy_t h;
+        mt_hierarchy_init_fence_sp(&h);
+        tree_ = matryoshka_bulk_load_with(keys, n, &h);
+    }
+    size_t size() const { return matryoshka_size(tree_); }
+    void clear() {
+        if (tree_) matryoshka_destroy(tree_);
+        mt_hierarchy_t h;
+        mt_hierarchy_init_fence_sp(&h);
+        tree_ = matryoshka_create_with(&h);
+    }
+};
+
 /* ── std::set (red-black tree) ──────────────────────────────── */
 
 class WrapperStdSet {

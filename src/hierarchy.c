@@ -92,6 +92,16 @@ void mt_hierarchy_init_superpage(mt_hierarchy_t *h)
     h->min_sp_keys     = h->sp_max_keys / 4;
 }
 
+void mt_hierarchy_init_fence_sp(mt_hierarchy_t *h)
+{
+    mt_hierarchy_init_default(h);
+    h->cl_strategy     = MT_CL_STRAT_FENCE;
+    h->leaf_alloc      = MT_SP_SIZE;
+    h->use_superpages  = true;
+    h->sp_max_keys     = 510 * h->page_max_keys;
+    h->min_sp_keys     = h->sp_max_keys / 4;
+}
+
 void mt_hierarchy_init_custom(mt_hierarchy_t *h, size_t leaf_alloc)
 {
     mt_hierarchy_init_default(h);

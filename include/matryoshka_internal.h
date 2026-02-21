@@ -370,6 +370,7 @@ void mt_hierarchy_init_default(mt_hierarchy_t *h);
 void mt_hierarchy_init_fence(mt_hierarchy_t *h);
 void mt_hierarchy_init_eytzinger(mt_hierarchy_t *h);
 void mt_hierarchy_init_superpage(mt_hierarchy_t *h);
+void mt_hierarchy_init_fence_sp(mt_hierarchy_t *h);
 void mt_hierarchy_init_custom(mt_hierarchy_t *h, size_t leaf_alloc);
 
 /* Page header flags (mt_page_header_t.flags). */

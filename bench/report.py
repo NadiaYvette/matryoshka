@@ -43,7 +43,7 @@ import jinja2
 
 ROOT = Path(__file__).resolve().parent.parent
 
-LIBRARIES = ["matryoshka", "matryoshka_fence", "std_set", "tlx_btree", "libart"]
+LIBRARIES = ["matryoshka", "matryoshka_fence", "matryoshka_fence_sp", "std_set", "tlx_btree", "libart"]
 WORKLOADS = [
     "seq_insert", "rand_insert", "rand_delete",
     "mixed", "ycsb_a", "ycsb_b", "search_after_churn",
@@ -53,6 +53,7 @@ DEFAULT_SIZES = [65536, 262144, 1048576, 4194304, 16777216]
 LIBRARY_COLORS = {
     "matryoshka":       "#2980b9",  # blue
     "matryoshka_fence": "#1a5276",  # dark blue
+    "matryoshka_fence_sp": "#117a65",  # dark teal
     "std_set":          "#e74c3c",  # red
     "tlx_btree":        "#8e44ad",  # purple
     "libart":           "#f39c12",  # orange
@@ -62,6 +63,7 @@ LIBRARY_COLORS = {
 LIBRARY_LABELS = {
     "matryoshka":       "Matryoshka B+ tree",
     "matryoshka_fence": "Matryoshka + fence keys",
+    "matryoshka_fence_sp": "Matryoshka + fence + SP",
     "std_set":          "std::set (RB tree)",
     "tlx_btree":        "TLX btree\\_set",
     "libart":           "libart (ART)",
@@ -71,6 +73,7 @@ LIBRARY_LABELS = {
 LIBRARY_LABELS_PLAIN = {
     "matryoshka":       "Matryoshka B+ tree",
     "matryoshka_fence": "Matryoshka + fence keys",
+    "matryoshka_fence_sp": "Matryoshka + fence + SP",
     "std_set":          "std::set (RB tree)",
     "tlx_btree":        "TLX btree_set",
     "libart":           "libart (ART)",
@@ -718,6 +721,7 @@ def make_hw_counter_chart(perf_data, libraries, chart_dir):
 LIBRARY_DESCRIPTIONS = {
     "matryoshka":       "B+ tree with nested CL sub-tree leaves (up to 855 keys/page), SIMD search, hugepage arena",
     "matryoshka_fence": "Matryoshka + fence keys in page header + mass prefetch of all fence children",
+    "matryoshka_fence_sp": "Matryoshka + fence keys + 2\\,MiB superpages for TLB coverage",
     "std_set":          "Red-black tree (libstdc++), pointer-chasing, 40--48\\,B/node",
     "tlx_btree":        "Cache-conscious B+ tree, sorted-array leaves ($B{\\approx}128$)",
     "libart":           "Adaptive Radix Tree, 4-byte keys, no predecessor search",
@@ -833,9 +837,10 @@ def _compute_analysis_vars(results, perf_data, profile_top, libraries, sizes):
     competitors = [lib for lib in libraries if lib != "matryoshka"]
 
     # ── Per-library throughput at largest and smallest sizes ──
-    all_libs = ["matryoshka", "matryoshka_fence", "std_set", "tlx_btree", "libart", "abseil_btree"]
+    all_libs = ["matryoshka", "matryoshka_fence", "matryoshka_fence_sp", "std_set", "tlx_btree", "libart", "abseil_btree"]
     lib_short = {
         "matryoshka": "mat", "matryoshka_fence": "matfence",
+        "matryoshka_fence_sp": "matfencesp",
         "std_set": "stdset", "tlx_btree": "tlx",
         "libart": "art", "abseil_btree": "abseil",
     }

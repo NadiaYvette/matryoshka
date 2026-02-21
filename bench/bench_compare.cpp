@@ -21,6 +21,7 @@ static const char *ALL_LIBRARIES[] = {
     "matryoshka",
     "matryoshka_fence",
     "matryoshka_eytz",
+    "matryoshka_fence_sp",
     "std_set",
 #ifdef HAS_ABSEIL
     "abseil_btree",
@@ -55,6 +56,8 @@ static void dispatch_library(const std::string &lib,
         run_workloads<WrapperMatryoshkaFence>(workloads, sizes);
     } else if (lib == "matryoshka_eytz") {
         run_workloads<WrapperMatryoshkaEytzinger>(workloads, sizes);
+    } else if (lib == "matryoshka_fence_sp") {
+        run_workloads<WrapperMatryoshkaFenceSP>(workloads, sizes);
     } else if (lib == "std_set") {
         run_workloads<WrapperStdSet>(workloads, sizes);
     }
@@ -83,7 +86,8 @@ static void usage(const char *prog)
     fprintf(stderr,
         "Usage: %s --library <name> --workload <name> --size <N>\n"
         "       %s --all\n\n"
-        "Libraries: matryoshka, matryoshka_fence, matryoshka_eytz, std_set"
+        "Libraries: matryoshka, matryoshka_fence, matryoshka_eytz,\n"
+        "           matryoshka_fence_sp, std_set"
 #ifdef HAS_ABSEIL
         ", abseil_btree"
 #endif
