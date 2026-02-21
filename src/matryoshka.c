@@ -238,8 +238,7 @@ matryoshka_tree_t *matryoshka_bulk_load_with(const int32_t *sorted_keys,
         }
         /* Link page leaves across superpage boundaries. */
         for (size_t i = 0; i + 1 < nleaves; i++) {
-            mt_lnode_t *last = mt_sp_first_leaf(entries[i].node);
-            while (last->header.next) last = last->header.next;
+            mt_lnode_t *last = mt_sp_last_leaf(entries[i].node);
             mt_lnode_t *first = mt_sp_first_leaf(entries[i + 1].node);
             last->header.next = first;
             first->header.prev = last;
@@ -489,13 +488,11 @@ static void split_sp_and_insert(matryoshka_tree_t *tree, mt_path_t *path,
     if (saved_next) saved_next->prev = new_right;
     sp->next = new_right;
 
-    /* Restore cross-superpage page-leaf links. */
-    mt_lnode_t *left_last = mt_sp_first_leaf(sp_node);
-    /* Navigate to last page leaf of left sp. */
-    while (left_last->header.next) left_last = left_last->header.next;
+    /* Restore cross-superpage page-leaf links.
+       Use mt_sp_last_leaf (B+ tree nav) to avoid stale linked-list pointers. */
+    mt_lnode_t *left_last = mt_sp_last_leaf(sp_node);
     mt_lnode_t *right_first = mt_sp_first_leaf(new_rnode);
-    mt_lnode_t *right_last = right_first;
-    while (right_last->header.next) right_last = right_last->header.next;
+    mt_lnode_t *right_last = mt_sp_last_leaf(new_rnode);
 
     /* Chain: prev_sp_last <-> left_first ... left_last <-> right_first ... right_last <-> next_sp_first */
     left_last->header.next = right_first;
@@ -874,25 +871,24 @@ static void rebalance_sp(matryoshka_tree_t *tree, mt_path_t *path,
             if (left_sp_prev) left_sp_prev->next = left;
             if (sp_next) sp_next->prev = sp;
 
-            /* Fix cross-superpage page-leaf links. */
-            mt_lnode_t *ll = mt_sp_first_leaf((void *)left);
-            while (ll->header.next) ll = ll->header.next;
+            /* Fix cross-superpage page-leaf links.
+               Use mt_sp_last_leaf (B+ tree nav) instead of linked-list
+               walk to avoid following stale cross-superpage pointers. */
+            mt_lnode_t *ll = mt_sp_last_leaf((void *)left);
             mt_lnode_t *rf = mt_sp_first_leaf(sp_node);
             ll->header.next = rf;
             rf->header.prev = ll;
 
             /* Fix boundary with prev superpage. */
             if (left_sp_prev && left_sp_prev->nkeys > 0) {
-                mt_lnode_t *plast = mt_sp_first_leaf((void *)left_sp_prev);
-                while (plast->header.next) plast = plast->header.next;
+                mt_lnode_t *plast = mt_sp_last_leaf((void *)left_sp_prev);
                 mt_lnode_t *lf = mt_sp_first_leaf((void *)left);
                 plast->header.next = lf;
                 lf->header.prev = plast;
             }
             /* Fix boundary with next superpage. */
             if (sp_next && sp_next->nkeys > 0) {
-                mt_lnode_t *rl = mt_sp_first_leaf(sp_node);
-                while (rl->header.next) rl = rl->header.next;
+                mt_lnode_t *rl = mt_sp_last_leaf(sp_node);
                 mt_lnode_t *nf = mt_sp_first_leaf((void *)sp_next);
                 rl->header.next = nf;
                 nf->header.prev = rl;
@@ -935,22 +931,19 @@ static void rebalance_sp(matryoshka_tree_t *tree, mt_path_t *path,
             if (sp_prev) sp_prev->next = sp;
             if (right_next) right_next->prev = right;
 
-            mt_lnode_t *ll = mt_sp_first_leaf(sp_node);
-            while (ll->header.next) ll = ll->header.next;
+            mt_lnode_t *ll = mt_sp_last_leaf(sp_node);
             mt_lnode_t *rf = mt_sp_first_leaf((void *)right);
             ll->header.next = rf;
             rf->header.prev = ll;
 
             if (sp_prev && sp_prev->nkeys > 0) {
-                mt_lnode_t *plast = mt_sp_first_leaf((void *)sp_prev);
-                while (plast->header.next) plast = plast->header.next;
+                mt_lnode_t *plast = mt_sp_last_leaf((void *)sp_prev);
                 mt_lnode_t *sf = mt_sp_first_leaf(sp_node);
                 plast->header.next = sf;
                 sf->header.prev = plast;
             }
             if (right_next && right_next->nkeys > 0) {
-                mt_lnode_t *rl = mt_sp_first_leaf((void *)right);
-                while (rl->header.next) rl = rl->header.next;
+                mt_lnode_t *rl = mt_sp_last_leaf((void *)right);
                 mt_lnode_t *nf = mt_sp_first_leaf((void *)right_next);
                 rl->header.next = nf;
                 nf->header.prev = rl;
@@ -990,18 +983,18 @@ static void rebalance_sp(matryoshka_tree_t *tree, mt_path_t *path,
 
         /* Fix page-leaf boundary links. */
         if (left_prev && left_prev->nkeys > 0) {
-            mt_lnode_t *plast = mt_sp_first_leaf((void *)left_prev);
-            while (plast->header.next) plast = plast->header.next;
+            mt_lnode_t *plast = mt_sp_last_leaf((void *)left_prev);
             mt_lnode_t *lf = mt_sp_first_leaf((void *)left);
             plast->header.next = lf;
             lf->header.prev = plast;
         }
-        mt_lnode_t *ll = mt_sp_first_leaf((void *)left);
-        while (ll->header.next) ll = ll->header.next;
+        mt_lnode_t *ll = mt_sp_last_leaf((void *)left);
         if (sp_next_save && sp_next_save->nkeys > 0) {
             mt_lnode_t *nf = mt_sp_first_leaf((void *)sp_next_save);
             ll->header.next = nf;
             nf->header.prev = ll;
+        } else {
+            ll->header.next = NULL;
         }
 
         inode_remove_at(parent, cidx - 1);
@@ -1032,18 +1025,18 @@ static void rebalance_sp(matryoshka_tree_t *tree, mt_path_t *path,
         if (right_next) right_next->prev = sp;
 
         if (sp_prev_save && sp_prev_save->nkeys > 0) {
-            mt_lnode_t *plast = mt_sp_first_leaf((void *)sp_prev_save);
-            while (plast->header.next) plast = plast->header.next;
+            mt_lnode_t *plast = mt_sp_last_leaf((void *)sp_prev_save);
             mt_lnode_t *sf = mt_sp_first_leaf(sp_node);
             plast->header.next = sf;
             sf->header.prev = plast;
         }
-        mt_lnode_t *sl = mt_sp_first_leaf(sp_node);
-        while (sl->header.next) sl = sl->header.next;
+        mt_lnode_t *sl = mt_sp_last_leaf(sp_node);
         if (right_next && right_next->nkeys > 0) {
             mt_lnode_t *nf = mt_sp_first_leaf((void *)right_next);
             sl->header.next = nf;
             nf->header.prev = sl;
+        } else {
+            sl->header.next = NULL;
         }
 
         inode_remove_at(parent, cidx);

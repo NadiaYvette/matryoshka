@@ -460,6 +460,9 @@ int32_t     mt_sp_max_key(const void *sp);
 /* Get the first page leaf in a superpage (for iterator start). */
 mt_lnode_t *mt_sp_first_leaf(void *sp);
 
+/* Get the last page leaf in a superpage (via B+ tree navigation). */
+mt_lnode_t *mt_sp_last_leaf(void *sp);
+
 /* Find the page leaf containing `key` in a superpage (for iterator seek). */
 mt_lnode_t *mt_sp_find_leaf(void *sp, int32_t key);
 

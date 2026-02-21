@@ -730,6 +730,12 @@ mt_lnode_t *mt_sp_first_leaf(void *sp)
     return (mt_lnode_t *)sp_page(sp, leaf_idx);
 }
 
+mt_lnode_t *mt_sp_last_leaf(void *sp)
+{
+    int leaf_idx = sp_rightmost_leaf(sp);
+    return (mt_lnode_t *)sp_page(sp, leaf_idx);
+}
+
 mt_lnode_t *mt_sp_find_leaf(void *sp, int32_t key)
 {
     mt_sp_path_t path[MT_SP_MAX_HEIGHT];
